@@ -6,6 +6,7 @@ import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -295,6 +296,12 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        }
         activeHostCount.incrementAndGet()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         surfaceView = newRendererSurfaceView()
