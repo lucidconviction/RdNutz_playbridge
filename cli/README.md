@@ -47,6 +47,8 @@ only the external-mpv playback adapter remains CLI-specific.
 playbridge
 playbridge discover
 playbridge send video.mp4
+playbridge send video.mp4 --json
+playbridge send video.mp4 --json --skip-history
 playbridge receiver --name "My Computer"
 playbridge browser video.mp4
 ```
@@ -62,9 +64,41 @@ First-time PlayBridge pairing also stays in the dashboard: compare the six-digit
 code shown there with the receiver, then confirm without leaving the TUI.
 Arrow keys and Vim keys (`h`, `j`, `k`, `l`) are supported; press `?` for the
 complete key guide.
-Machine-readable discovery and low-level diagnostic commands remain available
-for scripts. Interactive workflows require a terminal and always use the
-dashboard.
+Machine-readable commands remain available for scripts and agents. `discover
+--json` lists receivers. `send <file|URL> --json` casts to the preferred
+receiver (saved with `P` in the dashboard), prints newline-delimited JSON events, and waits
+until Ctrl+C so a local-file proxy stays up. If that receiver is unreachable,
+the command discovers LAN devices and either prompts (TTY) or returns
+`"error": "preferred_unreachable"` with a `receivers` list. Pass `--device`
+to select one. Unpaired PlayBridge receivers prompt for the SAS code, or
+accept `--pair-code`. While a JSON send is running, `status --json` reports
+playback and `control pause|play|toggle|stop|seek|volume|mute|speed` drives
+the receiver without the dashboard. `playbridge mcp` is a stdio MCP server
+for agents (discover, send, pairing code, status, control). Every send returns
+a `session_id`; pass it to pairing, status, and control calls so concurrent
+agents cannot affect each other's casts:
+
+```toml
+[mcp_servers.playbridge]
+command = "playbridge"
+args = ["mcp"]
+```
+
+PlayBridge receivers can exclude a cast from playback history. Use
+`--skip-history` for one cast or `--save-history` to explicitly retain it. Set
+the default for CLI and MCP casts with:
+
+```sh
+playbridge config skip-history on
+playbridge config skip-history off
+playbridge config skip-history
+```
+
+The MCP `send` tool accepts an optional `skip_history` boolean; when omitted it
+uses this saved default. Other receiver protocols ignore this PlayBridge-only
+history preference.
+
+Interactive dashboard workflows still require a terminal.
 
 The dashboard adapts to narrow terminals and supports mouse input when enabled.
 It honors `NO_COLOR` and includes dark, light, terminal, and monochrome themes:
@@ -83,6 +117,9 @@ optional. For example:
 theme = "playbridge-dark"
 mouse = true
 unicode = true
+
+[cast]
+skip_history = false
 
 [keys]
 down = ["down", "j"]

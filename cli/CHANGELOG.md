@@ -1,5 +1,23 @@
 # PlayBridge CLI Changelog
 
+## Unreleased
+
+- Add `--skip-history` and `--save-history` overrides for PlayBridge casts,
+  MCP `send.skip_history`, and a persisted `config skip-history on|off` default.
+
+- Add `playbridge send|cast <file|URL> --json` to cast to the preferred
+  receiver without the dashboard. Prints newline-delimited JSON events, then waits for
+  Ctrl+C so a local-file proxy stays up. If the preferred receiver is
+  unreachable, discover LAN devices and prompt (TTY) or return
+  `preferred_unreachable` with a `receivers` list for agents. `--device`
+  selects a receiver by id, uuid, name, or address. Unpaired PlayBridge
+  targets prompt for the SAS code or accept `--pair-code`. A successful
+  JSON send is saved as the preferred receiver. An active JSON send exposes
+  `playbridge status --json` and `playbridge control pause|play|toggle|stop|seek|volume|mute|speed`.
+  `playbridge mcp` exposes discover, send, submit_pair_code, status, and control
+  over MCP stdio for AI agents, with structured results, isolated session ids,
+  and pairing calls that wait for the receiver's actual success or failure.
+
 ## 0.2.0 (2026-08-10)
 
 - Make the full-screen dashboard the primary interface for casting, browser

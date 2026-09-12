@@ -5,18 +5,32 @@ use playbridge_browser_receiver::{
 use playbridge_cast_core::{
     browser::{BrowserCommand, BrowserMedia},
     castv2,
+    discovery::{
+        DiscoveryConfig, DiscoveryEvent, DiscoveryStream, Receiver, ReceiverId, ReceiverProtocol,
+    },
     playbridge::{PairingSession, ReceiverFrame, SenderFrame},
     secure_ws::SecureWebSocket,
     session::{MediaRequest, ReceiverSession},
     upnp::Renderer,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    env,
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+    time::Duration,
+};
 use stream_proxy_rust::{ProxyServer, ProxyServerConfig};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::credentials::PlaybridgeCredentials;
+use crate::{
+    credentials::PlaybridgeCredentials,
+    json_session::{self, ControlRequest, JsonCastSession, SessionInfo},
+    preferred::PreferredDevice,
+};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct CastCapabilities {
     pub play_pause: bool,
     pub seek: bool,
@@ -27,7 +41,7 @@ pub(crate) struct CastCapabilities {
     pub audio_boost: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct CastSnapshot {
     pub state: String,
     pub title: String,
@@ -87,6 +101,885 @@ pub(crate) enum CastCommand {
     Stop,
 }
 
+#[derive(Clone, Copy)]
+struct MachinePairing<'a> {
+    code: Option<&'a str>,
+    file: Option<&'a std::path::Path>,
+    session_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct JsonStatusContext<'a> {
+    session_id: &'a str,
+    receiver: &'a Receiver,
+    media: &'a str,
+    capabilities: &'a CastCapabilities,
+}
+
+/// Casts without the dashboard and prints one JSON object. Stays running until
+/// Ctrl+C so a local-file proxy is not torn down under the TV.
+///
+/// If the preferred receiver is unreachable, discovers LAN receivers and either
+/// prompts (TTY) or returns them in JSON so an agent can ask the user. PlayBridge
+/// targets without stored credentials go through SAS pairing.
+pub(crate) async fn run_json_cast(
+    media_target: String,
+    device: Option<String>,
+    pair_code: Option<String>,
+    pair_code_file: Option<String>,
+    requested_session_id: Option<String>,
+    skip_history_override: Option<bool>,
+) -> Result<(), String> {
+    if let Err(message) = validate_media_target(&media_target) {
+        emit_json(&json!({
+            "ok": false,
+            "error": "invalid_media",
+            "message": &message,
+        }))?;
+        return Err(message);
+    }
+
+    let skip_history = skip_history_override.unwrap_or(crate::ui::skip_history_default()?);
+    let session_id = requested_session_id.unwrap_or_else(JsonCastSession::generate_id);
+    let session = match JsonCastSession::claim(&session_id) {
+        Ok(session) => session,
+        Err(message) => {
+            emit_json(&json!({
+                "ok": false,
+                "error": if message == "invalid_session_id" { "invalid_session_id" } else { "session_in_use" },
+                "message": message,
+                "session_id": session_id,
+            }))?;
+            return Err(message);
+        }
+    };
+    let explicit_device = device.is_some();
+    let receiver = match resolve_json_receiver(device.as_deref()).await {
+        Ok(receiver) => receiver,
+        Err(error) => return Err(error),
+    };
+
+    let resolved_path = resolve_media_path(&media_target);
+    let (media_url, proxy_server) = if resolved_path.is_file() {
+        let server = ProxyServer::start(ProxyServerConfig::default()).await?;
+        let host = primary_lan_host(server.local_addr().port())?;
+        let media =
+            server.register_file(&host, resolved_path, None, Duration::from_secs(6 * 60 * 60))?;
+        (media.url, Some(server))
+    } else {
+        (media_target, None)
+    };
+
+    let pair_code_path = pair_code_file.as_deref().map(PathBuf::from);
+    let pairing = MachinePairing {
+        code: pair_code.as_deref(),
+        file: pair_code_path.as_deref(),
+        session_id: &session_id,
+    };
+    let (receiver, control) =
+        match connect_and_load(&media_url, receiver, pairing, skip_history).await {
+            Ok(connected) => connected,
+            Err(message) if !explicit_device && is_unreachable(&message) => {
+                match select_discovered_receiver(
+                    &format!("Preferred receiver is unreachable ({message})"),
+                    "preferred_unreachable",
+                    Some(&message),
+                )
+                .await
+                {
+                    Ok(fallback) => {
+                        match connect_and_load(&media_url, fallback, pairing, skip_history).await {
+                            Ok(connected) => connected,
+                            Err(message) => {
+                                emit_connect_error(&message, &session_id)?;
+                                return Err(message);
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(message) => {
+                emit_connect_error(&message, &session_id)?;
+                return Err(message);
+            }
+        };
+
+    let _ = save_receiver_as_preferred(&receiver);
+    let media = display_media_target(&media_url);
+    session.activate(&SessionInfo {
+        session_id: session_id.clone(),
+        pid: std::process::id(),
+        device: receiver.name.clone(),
+        protocol: receiver.protocol.as_str().to_owned(),
+        id: receiver.id.0.clone(),
+        media: media.clone(),
+    })?;
+    let capabilities = dashboard_capabilities(&control);
+    emit_json(&json!({
+        "ok": true,
+        "device": receiver.name,
+        "protocol": receiver.protocol.as_str(),
+        "id": receiver.id.0,
+        "media": media,
+        "control": true,
+        "skip_history": skip_history,
+        "session_id": session_id,
+    }))?;
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "Playing on {}. Use `playbridge control` / `playbridge status --json`, or Ctrl+C to stop.",
+            receiver.name
+        );
+    }
+
+    let result = json_session_loop(control, receiver, capabilities, media, &session).await;
+    if let Some(server) = proxy_server
+        && let Err(error) = server.shutdown().await
+    {
+        eprintln!("warning: failed to stop media proxy: {error}");
+    }
+    result
+}
+
+pub(crate) fn run_json_status(session_id: Option<&str>) -> Result<(), String> {
+    match JsonCastSession::read_status(session_id) {
+        Ok(status) => emit_json(&status),
+        Err(error) => {
+            emit_json(&json!({ "ok": false, "error": error }))?;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn run_json_control(
+    session_id: Option<&str>,
+    request: ControlRequest,
+) -> Result<(), String> {
+    match JsonCastSession::submit(session_id, request).await {
+        Ok(ack) => {
+            emit_json(&ack)?;
+            if ack.get("ok").and_then(Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(ack
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("control_failed")
+                    .to_owned())
+            }
+        }
+        Err(error) => {
+            emit_json(&json!({ "ok": false, "error": error }))?;
+            Err(error)
+        }
+    }
+}
+
+async fn json_session_loop(
+    mut control: TargetControl,
+    receiver: Receiver,
+    capabilities: CastCapabilities,
+    media: String,
+    session: &JsonCastSession,
+) -> Result<(), String> {
+    let mut snapshot = CastSnapshot {
+        state: "buffering".into(),
+        title: receiver.name.clone(),
+        position_ms: 0,
+        duration_ms: 0,
+        volume: capabilities.volume.then_some(0.5),
+        muted: capabilities.mute.then_some(false),
+        looping: capabilities.looping.then_some(false),
+        speed: capabilities.speed.then_some(1.0),
+    };
+    let status_context = JsonStatusContext {
+        session_id: session.id(),
+        receiver: &receiver,
+        media: &media,
+        capabilities: &capabilities,
+    };
+    session.write_status(&status_json(status_context, &snapshot))?;
+    let mut last_control_id = String::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut poll_count = 0_u64;
+    let mut consecutive_poll_failures = 0_u8;
+    loop {
+        tokio::select! {
+            _ = wait_interrupt() => break,
+            _ = tick.tick() => {
+                poll_count = poll_count.wrapping_add(1);
+                if poll_count.is_multiple_of(4) {
+                    let heartbeat = poll_count.is_multiple_of(12);
+                    if let Err(message) =
+                        dashboard_poll(&mut control, &mut snapshot, heartbeat).await
+                    {
+                        consecutive_poll_failures = consecutive_poll_failures.saturating_add(1);
+                        if consecutive_poll_failures >= 12 {
+                            stop_target(control).await;
+                            return Err(format!("cast connection lost: {message}"));
+                        }
+                    } else {
+                        consecutive_poll_failures = 0;
+                    }
+                }
+                if let Some(request) = session.take_request(&last_control_id) {
+                    last_control_id = request.id.clone();
+                    match apply_json_control(&mut control, &mut snapshot, &request).await {
+                        Ok(JsonControlResult::Stop) => {
+                            snapshot.state = "stopped".into();
+                            let _ = session.write_ack(&control_ack(
+                                status_context,
+                                &request,
+                                true,
+                                None,
+                                &snapshot,
+                            ));
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            break;
+                        }
+                        Ok(JsonControlResult::Applied) => {
+                            let _ = session.write_ack(&control_ack(
+                                status_context,
+                                &request,
+                                true,
+                                None,
+                                &snapshot,
+                            ));
+                        }
+                        Err(message) => {
+                            let _ = session.write_ack(&control_ack(
+                                status_context,
+                                &request,
+                                false,
+                                Some(&message),
+                                &snapshot,
+                            ));
+                        }
+                    }
+                }
+                let _ = session.write_status(&status_json(
+                    status_context,
+                    &snapshot,
+                ));
+            }
+        }
+    }
+    stop_target(control).await;
+    Ok(())
+}
+
+fn status_json(context: JsonStatusContext<'_>, snapshot: &CastSnapshot) -> Value {
+    json!({
+        "ok": true,
+        "session_id": context.session_id,
+        "updated_ms": json_session::now_ms(),
+        "device": context.receiver.name,
+        "protocol": context.receiver.protocol.as_str(),
+        "id": context.receiver.id.0,
+        "media": context.media,
+        "state": snapshot.state,
+        "title": snapshot.title,
+        "position_ms": snapshot.position_ms,
+        "duration_ms": snapshot.duration_ms,
+        "volume": snapshot.volume,
+        "muted": snapshot.muted,
+        "looping": snapshot.looping,
+        "speed": snapshot.speed,
+        "capabilities": context.capabilities,
+    })
+}
+
+fn control_ack(
+    context: JsonStatusContext<'_>,
+    request: &ControlRequest,
+    ok: bool,
+    error: Option<&str>,
+    snapshot: &CastSnapshot,
+) -> Value {
+    let mut ack = status_json(context, snapshot);
+    ack["request_id"] = json!(request.id);
+    ack["command"] = json!(request.command);
+    ack["ok"] = json!(ok);
+    if let Some(error) = error {
+        ack["error"] = json!(error);
+    }
+    ack
+}
+
+enum JsonControlResult {
+    Applied,
+    Stop,
+}
+
+async fn apply_json_control(
+    control: &mut TargetControl,
+    snapshot: &mut CastSnapshot,
+    request: &ControlRequest,
+) -> Result<JsonControlResult, String> {
+    match request.command.as_str() {
+        "stop" => Ok(JsonControlResult::Stop),
+        "pause" => {
+            if snapshot.state != "paused" {
+                dashboard_control(control, CastCommand::PlayPause, snapshot).await?;
+            }
+            Ok(JsonControlResult::Applied)
+        }
+        "play" => {
+            if snapshot.state == "paused" {
+                dashboard_control(control, CastCommand::PlayPause, snapshot).await?;
+            }
+            Ok(JsonControlResult::Applied)
+        }
+        "toggle" => {
+            dashboard_control(control, CastCommand::PlayPause, snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "seek" => {
+            let seconds = request
+                .seconds
+                .ok_or_else(|| "seek requires seconds".to_owned())?;
+            json_seek(control, snapshot, seconds).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "volume" => {
+            let delta = request
+                .delta
+                .ok_or_else(|| "volume requires a delta".to_owned())?;
+            dashboard_control(control, CastCommand::VolumeDelta(delta), snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "mute" => {
+            dashboard_control(control, CastCommand::ToggleMute, snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "speed" => {
+            let value = request
+                .value
+                .ok_or_else(|| "speed requires a value".to_owned())?;
+            dashboard_control(control, CastCommand::SetSpeed(value), snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        other => Err(format!("unknown control command: {other}")),
+    }
+}
+
+async fn json_seek(
+    control: &mut TargetControl,
+    snapshot: &mut CastSnapshot,
+    seconds: i64,
+) -> Result<(), String> {
+    let mut position_ms = snapshot
+        .position_ms
+        .saturating_add_signed(seconds.saturating_mul(1000));
+    if snapshot.duration_ms > 0 {
+        position_ms = position_ms.min(snapshot.duration_ms);
+    }
+    match control {
+        TargetControl::Playbridge(socket) => {
+            socket
+                .send(&SenderFrame::Command {
+                    action: "control".into(),
+                    payload: Some(json!({ "command": format!("seek_to:{position_ms}") })),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            snapshot.position_ms = position_ms;
+            Ok(())
+        }
+        _ => dashboard_control(control, CastCommand::SeekRelative(seconds), snapshot).await,
+    }
+}
+
+async fn wait_interrupt() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = ctrl_c.await;
+}
+
+pub(crate) fn emit_json(value: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+    );
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush JSON output: {error}"))
+}
+
+fn receiver_from_preferred(preferred: &PreferredDevice) -> Result<Receiver, String> {
+    let protocol = preferred
+        .protocol
+        .parse::<ReceiverProtocol>()
+        .map_err(|error| error.to_string())?;
+    Ok(Receiver {
+        id: ReceiverId(preferred.uuid.clone()),
+        protocol,
+        name: preferred.name.clone(),
+        addresses: vec![preferred.address.clone()],
+        port: preferred.port,
+        wss_port: preferred.wss_port,
+        location: preferred.location.clone(),
+        uuid: Some(preferred.uuid.clone()),
+    })
+}
+
+fn is_unreachable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("connection refused")
+        || lower.contains("network is down")
+}
+
+fn can_prompt() -> bool {
+    io::stdin().is_terminal() && io::stderr().is_terminal()
+}
+
+fn receiver_uuid(receiver: &Receiver) -> String {
+    receiver
+        .uuid
+        .clone()
+        .unwrap_or_else(|| receiver.id.0.clone())
+}
+
+fn receiver_matches_device(receiver: &Receiver, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    receiver.id.0.eq_ignore_ascii_case(selector)
+        || receiver
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(selector))
+        || receiver.name.eq_ignore_ascii_case(selector)
+        || receiver.addresses.iter().any(|address| address == selector)
+}
+
+fn receiver_is_paired(receiver: &Receiver) -> bool {
+    if receiver.protocol != ReceiverProtocol::PlayBridge {
+        return true;
+    }
+    PlaybridgeCredentials::load(&receiver_uuid(receiver)).is_some()
+}
+
+fn json_receiver(receiver: &Receiver) -> Value {
+    json!({
+        "id": receiver.id.0,
+        "protocol": receiver.protocol.as_str(),
+        "name": receiver.name,
+        "addresses": receiver.addresses,
+        "port": receiver.port,
+        "wss_port": receiver.wss_port,
+        "location": receiver.location,
+        "uuid": receiver.uuid,
+        "paired": receiver_is_paired(receiver),
+    })
+}
+
+fn save_receiver_as_preferred(receiver: &Receiver) -> Result<(), String> {
+    let address = receiver
+        .addresses
+        .iter()
+        .find(|address| address.contains('.'))
+        .cloned()
+        .or_else(|| receiver.addresses.first().cloned())
+        .unwrap_or_default();
+    PreferredDevice {
+        uuid: receiver_uuid(receiver),
+        name: receiver.name.clone(),
+        protocol: receiver.protocol.as_str().into(),
+        address,
+        port: receiver.port,
+        wss_port: receiver.wss_port,
+        location: receiver.location.clone(),
+    }
+    .save()
+}
+
+async fn discover_receivers() -> Vec<Receiver> {
+    let mut stream = DiscoveryStream::start(DiscoveryConfig::selected(
+        HashSet::from(ReceiverProtocol::DEFAULTS),
+        Duration::from_secs(5),
+    ));
+    let mut receivers = BTreeMap::<String, Receiver>::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            DiscoveryEvent::Found(receiver) | DiscoveryEvent::Updated(receiver) => {
+                receivers.insert(receiver.id.0.clone(), receiver);
+            }
+            _ => {}
+        }
+    }
+    receivers.into_values().collect()
+}
+
+async fn resolve_json_receiver(device: Option<&str>) -> Result<Receiver, String> {
+    if let Some(selector) = device {
+        let discovered = discover_receivers().await;
+        if let Some(receiver) = discovered
+            .iter()
+            .find(|receiver| receiver_matches_device(receiver, selector))
+        {
+            return Ok(receiver.clone());
+        }
+        if let Some(preferred) = PreferredDevice::load()
+            && let Ok(receiver) = receiver_from_preferred(&preferred)
+            && receiver_matches_device(&receiver, selector)
+        {
+            return Ok(receiver);
+        }
+        emit_json(&json!({
+            "ok": false,
+            "error": "device_not_found",
+            "device": selector,
+            "receivers": discovered.iter().map(json_receiver).collect::<Vec<_>>(),
+        }))?;
+        return Err("device_not_found".into());
+    }
+
+    if let Some(preferred) = PreferredDevice::load() {
+        return receiver_from_preferred(&preferred).inspect_err(|message| {
+            let _ = emit_json(&json!({
+                "ok": false,
+                "error": "unsupported_protocol",
+                "protocol": preferred.protocol,
+                "message": message,
+            }));
+        });
+    }
+
+    select_discovered_receiver(
+        "No preferred receiver is saved.",
+        "no_preferred_device",
+        None,
+    )
+    .await
+}
+
+async fn select_discovered_receiver(
+    reason: &str,
+    error: &str,
+    message: Option<&str>,
+) -> Result<Receiver, String> {
+    let discovered = discover_receivers().await;
+    if discovered.is_empty() {
+        let mut report = json!({
+            "ok": false,
+            "error": "no_receivers_found",
+            "message": reason,
+        });
+        if let Some(message) = message {
+            report["cause"] = json!(message);
+        }
+        emit_json(&report)?;
+        return Err("no_receivers_found".into());
+    }
+
+    if can_prompt() {
+        eprintln!("{reason}");
+        eprintln!("Discovered receivers:");
+        for (index, receiver) in discovered.iter().enumerate() {
+            let address = receiver
+                .addresses
+                .iter()
+                .find(|address| address.contains('.'))
+                .or_else(|| receiver.addresses.first())
+                .map(String::as_str)
+                .unwrap_or("-");
+            let pairing = if receiver_is_paired(receiver) {
+                "ready"
+            } else {
+                "needs pairing"
+            };
+            eprintln!(
+                "  {}. {}  {}  {}  [{pairing}]",
+                index + 1,
+                receiver.name,
+                receiver.protocol.as_str(),
+                address
+            );
+        }
+        eprint!("Connect to which receiver? [1-{}] ", discovered.len());
+        let _ = io::stderr().flush();
+        let choice = read_stdin_line().await?;
+        if choice.is_empty() || choice.eq_ignore_ascii_case("q") {
+            emit_json(&json!({
+                "ok": false,
+                "error": "cancelled",
+                "message": "No receiver selected",
+            }))?;
+            return Err("cancelled".into());
+        }
+        if let Ok(index) = choice.parse::<usize>()
+            && index >= 1
+            && index <= discovered.len()
+        {
+            return Ok(discovered[index - 1].clone());
+        }
+        if let Some(receiver) = discovered
+            .iter()
+            .find(|receiver| receiver_matches_device(receiver, &choice))
+        {
+            return Ok(receiver.clone());
+        }
+        emit_json(&json!({
+            "ok": false,
+            "error": "device_not_found",
+            "device": choice,
+            "receivers": discovered.iter().map(json_receiver).collect::<Vec<_>>(),
+        }))?;
+        return Err("device_not_found".into());
+    }
+
+    let mut report = json!({
+        "ok": false,
+        "error": error,
+        "message": reason,
+        "receivers": discovered.iter().map(json_receiver).collect::<Vec<_>>(),
+    });
+    if let Some(message) = message {
+        report["cause"] = json!(message);
+    }
+    emit_json(&report)?;
+    Err(error.into())
+}
+
+async fn read_stdin_line() -> Result<String, String> {
+    let mut line = String::new();
+    BufReader::new(tokio::io::stdin())
+        .read_line(&mut line)
+        .await
+        .map_err(|error| format!("failed to read stdin: {error}"))?;
+    Ok(line.trim().to_owned())
+}
+
+fn emit_connect_error(message: &str, session_id: &str) -> Result<(), String> {
+    if message == "pairing_required" {
+        emit_json(&json!({
+            "ok": false,
+            "error": "pairing_required",
+            "message": "PlayBridge receiver is unpaired. Re-run with a TTY to enter the code, or pass --pair-code.",
+            "session_id": session_id,
+        }))
+    } else {
+        emit_json(&json!({
+            "ok": false,
+            "error": "cast_failed",
+            "message": message,
+            "session_id": session_id,
+        }))
+    }
+}
+
+async fn connect_and_load(
+    media_url: &str,
+    receiver: Receiver,
+    pairing: MachinePairing<'_>,
+    skip_history: bool,
+) -> Result<(Receiver, TargetControl), String> {
+    let address = receiver
+        .addresses
+        .iter()
+        .find(|address| address.contains('.'))
+        .cloned()
+        .or_else(|| receiver.addresses.first().cloned())
+        .ok_or_else(|| format!("{} has no reachable address", receiver.name))?;
+    let protocol = receiver.protocol;
+    let control = match protocol {
+        ReceiverProtocol::PlayBridge => {
+            let port = receiver.wss_port.or(receiver.port).unwrap_or(8765);
+            let uuid = receiver_uuid(&receiver);
+            TargetControl::Playbridge(Box::new(
+                cast_to_playbridge_maybe_pair(
+                    &address,
+                    port,
+                    &receiver.name,
+                    &uuid,
+                    media_url,
+                    pairing,
+                    skip_history,
+                )
+                .await?,
+            ))
+        }
+        _ => cast_to_target(
+            protocol.as_str(),
+            &address,
+            receiver.port,
+            receiver.location.as_deref(),
+            media_url,
+            &receiver.name,
+        )
+        .await?
+        .ok_or_else(|| format!("{} did not provide playback controls", receiver.name))?,
+    };
+    Ok((receiver, control))
+}
+
+async fn wait_for_pair_code(
+    device_name: &str,
+    pair_code: Option<&str>,
+    pair_code_file: Option<&std::path::Path>,
+    session_id: &str,
+) -> Result<String, String> {
+    emit_json(&json!({
+        "ok": false,
+        "error": "pairing_required",
+        "event": "pairing_required",
+        "device": device_name,
+        "message": format!("Enter the six-digit code shown by {device_name}"),
+        "pair_code_file": pair_code_file.map(|path| path.display().to_string()),
+        "session_id": session_id,
+    }))?;
+    if io::stderr().is_terminal() {
+        eprintln!("Enter the six-digit code shown by {device_name}:");
+        let _ = io::stderr().flush();
+    }
+
+    if let Some(code) = pair_code.filter(|code| !code.trim().is_empty()) {
+        return normalize_pair_code(code);
+    }
+    if let Some(path) = pair_code_file {
+        return wait_for_pair_code_file(path).await;
+    }
+    let entered = read_stdin_line().await?;
+    if entered.is_empty() {
+        return Err("pairing_required".into());
+    }
+    normalize_pair_code(&entered)
+}
+
+async fn wait_for_pair_code_file(path: &std::path::Path) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut last = String::new();
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let code: String = contents.chars().filter(|ch| ch.is_ascii_digit()).collect();
+            if code.len() == 6 && code != last {
+                let _ = std::fs::remove_file(path);
+                return Ok(code);
+            }
+            last = code;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("pairing_required: timed out waiting for --pair-code-file".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn normalize_pair_code(value: &str) -> Result<String, String> {
+    let digits: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() != 6 {
+        return Err("Pairing code must contain exactly six digits".into());
+    }
+    Ok(digits)
+}
+
+async fn cast_to_playbridge_maybe_pair(
+    address: &str,
+    wss_port: u16,
+    device_name: &str,
+    device_uuid: &str,
+    media_url: &str,
+    machine_pairing: MachinePairing<'_>,
+    skip_history: bool,
+) -> Result<SecureWebSocket, String> {
+    if PlaybridgeCredentials::load(device_uuid).is_some() {
+        return cast_to_playbridge(
+            address,
+            wss_port,
+            device_name,
+            device_uuid,
+            media_url,
+            skip_history,
+        )
+        .await;
+    }
+
+    let endpoint = playbridge_cast_core::net::wss_endpoint(address, wss_port);
+    let mut socket = SecureWebSocket::connect_for_pairing(&endpoint)
+        .await
+        .map_err(|error| error.to_string())?;
+    let served_pin = socket.served_spki_pin().to_owned();
+    let (mut pairing, commit) =
+        PairingSession::start(device_name.to_owned(), device_uuid.to_owned())
+            .map_err(|error| error.to_string())?;
+    socket
+        .send(&commit)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    while let Some(frame) = socket.receive().await.map_err(|error| error.to_string())? {
+        match frame {
+            ReceiverFrame::PairingChallenge {
+                tv_eph_pub,
+                nonce_t,
+            } => {
+                let (sas, reveal) = pairing
+                    .accept_challenge(&tv_eph_pub, &nonce_t)
+                    .map_err(|error| error.to_string())?;
+                socket
+                    .send(&reveal)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let entered = wait_for_pair_code(
+                    device_name,
+                    machine_pairing.code,
+                    machine_pairing.file,
+                    machine_pairing.session_id,
+                )
+                .await?;
+                let confirmation = pairing
+                    .confirmation(&entered, &sas)
+                    .map_err(|_| "The code does not match the receiver".to_owned())?;
+                socket
+                    .send(&confirmation)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            ReceiverFrame::PairingApproved { nonce, ciphertext } => {
+                let bundle = pairing
+                    .decrypt_credentials(&nonce, &ciphertext, Some(&served_pin))
+                    .map_err(|error| error.to_string())?;
+                let credentials = PlaybridgeCredentials {
+                    token: bundle.token,
+                    cert_fingerprint: bundle
+                        .cert_fingerprint
+                        .unwrap_or_else(|| served_pin.clone()),
+                    players: bundle.players,
+                    browsers: bundle.browsers,
+                };
+                credentials.save(device_uuid)?;
+                send_playlist(&mut socket, media_url, device_name, skip_history).await?;
+                return Ok(socket);
+            }
+            ReceiverFrame::PairingDenied => {
+                return Err("Pairing was denied or timed out on the receiver".into());
+            }
+            _ => {}
+        }
+    }
+
+    Err("Receiver closed connection before pairing completed".into())
+}
+
 /// Runs a cast selected by the dashboard. Unlike the legacy command path this
 /// never reads the terminal: the dashboard remains responsible for input and
 /// sends the stop signal when the user ends the session.
@@ -96,8 +989,10 @@ pub(crate) async fn run_dashboard_cast(
     generation: u64,
     mut commands: tokio::sync::mpsc::Receiver<CastCommand>,
     events: tokio::sync::mpsc::Sender<CastEvent>,
+    skip_history_override: Option<bool>,
 ) -> Result<(), String> {
     validate_media_target(&media_target)?;
+    let skip_history = skip_history_override.unwrap_or(crate::ui::skip_history_default()?);
     let dashboard_title = media_title(&media_target).unwrap_or_else(|| "Untitled media".into());
 
     let resolved_path = resolve_media_path(&media_target);
@@ -135,6 +1030,7 @@ pub(crate) async fn run_dashboard_cast(
                         commands: &mut commands,
                         events: &events,
                     },
+                    skip_history,
                 )
                 .await?,
             ))
@@ -408,7 +1304,6 @@ pub(crate) fn validate_media_target(media_target: &str) -> Result<(), String> {
     Err(format!("media file does not exist: {}", path.display()))
 }
 
-#[cfg(test)]
 fn display_media_target(target: &str) -> String {
     let Ok(url) = reqwest::Url::parse(target) else {
         return target.to_owned();
@@ -959,6 +1854,7 @@ async fn cast_to_playbridge(
     device_name: &str,
     device_uuid: &str,
     media_url: &str,
+    skip_history: bool,
 ) -> Result<SecureWebSocket, String> {
     let credentials = PlaybridgeCredentials::load(device_uuid)
         .ok_or_else(|| format!("{device_name} has no stored pairing credentials"))?;
@@ -984,7 +1880,7 @@ async fn cast_to_playbridge(
         }
     }
 
-    send_playlist(&mut socket, media_url, device_name).await?;
+    send_playlist(&mut socket, media_url, device_name, skip_history).await?;
     Ok(socket)
 }
 
@@ -1001,6 +1897,7 @@ async fn cast_to_playbridge_dashboard(
     device_uuid: &str,
     media_url: &str,
     pairing_ui: DashboardPairing<'_>,
+    skip_history: bool,
 ) -> Result<SecureWebSocket, String> {
     let DashboardPairing {
         generation,
@@ -1008,7 +1905,15 @@ async fn cast_to_playbridge_dashboard(
         events,
     } = pairing_ui;
     if PlaybridgeCredentials::load(device_uuid).is_some() {
-        return cast_to_playbridge(address, wss_port, device_name, device_uuid, media_url).await;
+        return cast_to_playbridge(
+            address,
+            wss_port,
+            device_name,
+            device_uuid,
+            media_url,
+            skip_history,
+        )
+        .await;
     }
 
     let endpoint = playbridge_cast_core::net::wss_endpoint(address, wss_port);
@@ -1101,7 +2006,7 @@ async fn cast_to_playbridge_dashboard(
                     })
                     .await
                     .map_err(|_| "dashboard closed after pairing".to_owned())?;
-                send_playlist(&mut socket, media_url, device_name).await?;
+                send_playlist(&mut socket, media_url, device_name, skip_history).await?;
                 return Ok(socket);
             }
             ReceiverFrame::PairingDenied => {
@@ -1118,23 +2023,41 @@ async fn send_playlist(
     socket: &mut SecureWebSocket,
     media_url: &str,
     device_name: &str,
+    skip_history: bool,
 ) -> Result<(), String> {
-    let cmd = SenderFrame::Command {
+    socket
+        .send(&playlist_command(media_url, device_name, skip_history))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn playlist_command(media_url: &str, device_name: &str, skip_history: bool) -> SenderFrame {
+    SenderFrame::Command {
         action: "playlist".into(),
         payload: Some(serde_json::json!({
             "items": [{
                 "url": media_url,
                 "title": device_name,
+                "skipHistory": skip_history,
             }]
         })),
-    };
-    socket.send(&cmd).await.map_err(|e| e.to_string())?;
-    Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_command_sets_skip_history() {
+        let SenderFrame::Command { payload, .. } =
+            playlist_command("https://example.test/video.mp4", "TV", true)
+        else {
+            panic!("expected command");
+        };
+        assert_eq!(payload.unwrap()["items"][0]["skipHistory"], true);
+    }
 
     #[test]
     fn media_target_validation_accepts_http_urls() {
@@ -1157,5 +2080,117 @@ mod tests {
             "https://example.test/video.m3u8?<redacted>"
         );
         assert_eq!(display_media_target("/tmp/video.mp4"), "/tmp/video.mp4");
+    }
+
+    fn preferred_device(protocol: &str) -> PreferredDevice {
+        PreferredDevice {
+            uuid: "tv-1".into(),
+            name: "Living Room".into(),
+            protocol: protocol.into(),
+            address: "192.168.1.20".into(),
+            port: Some(8765),
+            wss_port: Some(8765),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn receiver_from_preferred_copies_identity_fields() {
+        let receiver = receiver_from_preferred(&preferred_device("dlna")).unwrap();
+        assert_eq!(receiver.id.0, "tv-1");
+        assert_eq!(receiver.protocol, ReceiverProtocol::Dlna);
+        assert_eq!(receiver.name, "Living Room");
+        assert_eq!(receiver.addresses, vec!["192.168.1.20"]);
+        assert_eq!(receiver.port, Some(8765));
+        assert_eq!(receiver.wss_port, Some(8765));
+        assert_eq!(receiver.uuid.as_deref(), Some("tv-1"));
+    }
+
+    #[test]
+    fn receiver_from_preferred_rejects_unknown_protocols() {
+        let error = receiver_from_preferred(&preferred_device("miracast")).unwrap_err();
+        assert!(error.contains("unsupported receiver protocol"));
+    }
+
+    #[test]
+    fn unreachable_detects_timeouts_and_ignores_auth_failures() {
+        assert!(is_unreachable(
+            "protocol operation failed: PlayBridge WebSocket connection timed out"
+        ));
+        assert!(is_unreachable("No route to host"));
+        assert!(!is_unreachable("Authentication failed"));
+        assert!(!is_unreachable("pairing_required"));
+    }
+
+    #[test]
+    fn receiver_matches_device_by_id_name_uuid_or_address() {
+        let receiver = receiver_from_preferred(&preferred_device("playbridge")).unwrap();
+        assert!(receiver_matches_device(&receiver, "tv-1"));
+        assert!(receiver_matches_device(&receiver, "Living Room"));
+        assert!(receiver_matches_device(&receiver, "192.168.1.20"));
+        assert!(!receiver_matches_device(&receiver, "Kitchen"));
+    }
+
+    #[test]
+    fn json_success_and_error_shapes_are_stable() {
+        let success = json!({
+            "ok": true,
+            "device": "Living Room",
+            "protocol": "dlna",
+            "media": "https://example.test/video.m3u8",
+        });
+        assert_eq!(success["ok"], true);
+        assert_eq!(success["protocol"], "dlna");
+
+        let missing = json!({ "ok": false, "error": "no_preferred_device" });
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error"], "no_preferred_device");
+
+        let pairing = json!({
+            "ok": false,
+            "error": "pairing_required",
+            "device": "Living Room",
+        });
+        assert_eq!(pairing["error"], "pairing_required");
+        assert_eq!(pairing["device"], "Living Room");
+    }
+
+    #[test]
+    fn control_ack_preserves_receiver_id_and_names_request_id() {
+        let receiver = receiver_from_preferred(&preferred_device("playbridge")).unwrap();
+        let capabilities = CastCapabilities::default();
+        let snapshot = CastSnapshot {
+            state: "stopped".into(),
+            title: "Video".into(),
+            position_ms: 1000,
+            duration_ms: 2000,
+            volume: None,
+            muted: None,
+            looping: None,
+            speed: None,
+        };
+        let request = ControlRequest {
+            id: "request-1".into(),
+            command: "stop".into(),
+            seconds: None,
+            delta: None,
+            value: None,
+        };
+        let ack = control_ack(
+            JsonStatusContext {
+                session_id: "session-1",
+                receiver: &receiver,
+                media: "video.mp4",
+                capabilities: &capabilities,
+            },
+            &request,
+            true,
+            None,
+            &snapshot,
+        );
+
+        assert_eq!(ack["id"], "tv-1");
+        assert_eq!(ack["request_id"], "request-1");
+        assert_eq!(ack["state"], "stopped");
     }
 }
