@@ -1,6 +1,6 @@
 # PlayBridge CLI Changelog
 
-## Unreleased
+## 0.3.0 (2026-09-12)
 
 - Add `--skip-history` and `--save-history` overrides for PlayBridge casts,
   MCP `send.skip_history`, and a persisted `config skip-history on|off` default.
