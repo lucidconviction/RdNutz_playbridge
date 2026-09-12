@@ -6,7 +6,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Player [0.14.0] — 2026-09-12 (versionCode 230)
 
 ### Added
-- **Standby pairing wake**: Wake supported Google TV panels when an incoming PlayBridge pairing request arrives, then keep the Connect screen visible for the exact request result.
+- **Standby wake**: Request the screen turn on for incoming PlayBridge pairing requests and playback on supported Android TV devices, then keep the Connect screen visible for the exact pairing result.
 
 ### Fixed
 - **Pairing navigation reliability**: Keep Connect selected after a pairing denial, timeout, or stale completion, including when another sender remains connected.
