@@ -26,7 +26,10 @@ import com.playbridge.player.pairing.PairingStore
 import com.playbridge.player.model.PairedDevice
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import java.net.Inet4Address
@@ -330,6 +333,9 @@ class ServerService : Service() {
                     )
                     newToken
                 },
+                onPairingCompleted = { deviceUUID, approved ->
+                    _pairingCompletions.tryEmit(PairingCompletion(deviceUUID, approved))
+                },
                 tlsDir = tlsDir,
                 // Persist and advertise only after Java-WebSocket confirms the listener
                 // is bound. The SRV port and wss_port must describe the same live endpoint.
@@ -408,19 +414,8 @@ class ServerService : Service() {
                 // When the phone sends request_pairing, bring the app to the foreground showing
                 // PairingScreen so the user can read the PIN before typing it on the phone.
                 launch {
-                    var lastPairingLaunchMs = 0L
-                    val pairingCooldownMs = 8_000L  // ignore repeat signals within 8 s
-
                     server.connectionAttemptFlow.collect {
                         try {
-                            val now = System.currentTimeMillis()
-
-                            // ── Spam guard ──────────────────────────────────────────────────────────
-                            if (now - lastPairingLaunchMs < pairingCooldownMs) {
-                                FileLogger.d(TAG, "request_pairing ignored — cooldown active (${now - lastPairingLaunchMs} ms ago)")
-                                return@collect
-                            }
-
                             // ── Context guard ────────────────────────────────────────────────────────
                             when (activeContext) {
                                 "player", "external_player" -> {
@@ -432,8 +427,6 @@ class ServerService : Service() {
                                     return@collect
                                 }
                             }
-
-                            lastPairingLaunchMs = now
 
                             overlayWindow.show()
                             val intent = Intent(applicationContext, MainActivity::class.java).apply {
@@ -1216,6 +1209,11 @@ class ServerService : Service() {
         // Static flow exposing a pending pairing request so MainActivity can show Allow/Deny UI.
         private val _pendingPairingRequest = MutableStateFlow<WebSocketServer.PairingRequest?>(null)
         val pendingPairingRequest: StateFlow<WebSocketServer.PairingRequest?> = _pendingPairingRequest.asStateFlow()
+
+        data class PairingCompletion(val deviceUUID: String, val approved: Boolean)
+
+        private val _pairingCompletions = MutableSharedFlow<PairingCompletion>(extraBufferCapacity = 1)
+        val pairingCompletions: SharedFlow<PairingCompletion> = _pairingCompletions.asSharedFlow()
 
         fun denyPairing() { _staticInstance?.webSocketServer?.denyPairing() }
 

@@ -64,6 +64,7 @@ class WebSocketServer(
     private val port: Int = com.playbridge.shared.protocol.Config.DEFAULT_PORT,
     private val isTokenAuthorized: suspend (String) -> Boolean,
     private val onPairingApproved: suspend (deviceName: String, deviceUUID: String) -> String,
+    private val onPairingCompleted: (deviceUUID: String, approved: Boolean) -> Unit = { _, _ -> },
     // App-private directory for the persisted TLS identity (PKCS12). wss:// is
     // disabled if null.
     private val tlsDir: File? = null,
@@ -560,12 +561,14 @@ class WebSocketServer(
                         }
                         registerAuthed(conn)
                         inProgressHandshakes.remove(conn)
+                        onPairingCompleted(handshake.deviceUUID, true)
                     } else {
                         if (conn.isOpen) {
                             conn.send(createPairingDeniedJson())
                             conn.close()
                         }
                         recordPairingFailure(ip)
+                        onPairingCompleted(handshake.deviceUUID, false)
                     }
                 } catch (e: Exception) {
                     FileLogger.w(TAG, "Error in pairing approval coroutine", e)
