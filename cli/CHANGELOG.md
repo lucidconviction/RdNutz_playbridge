@@ -1,5 +1,11 @@
 # PlayBridge CLI Changelog
 
+## 0.3.1 (2026-09-12)
+
+- Fix MCP output schemas for strict SDK clients, reject ambiguous receiver names
+  with protocol-qualified choices, preserve media filenames as playback titles,
+  and provide dedicated MCP and Google Cast help.
+
 ## 0.3.0 (2026-09-12)
 
 - Add `--skip-history` and `--save-history` overrides for PlayBridge casts,
