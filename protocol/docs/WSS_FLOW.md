@@ -145,6 +145,9 @@ that outer frame.
 The sender decrypts and validates the bundle, compares `certFingerprint` with the certificate
 actually served by the current WSS connection, then stores token + pin together in platform
 secure storage. A mismatch or authentication failure discards the bundle and closes the socket.
+When pairing succeeds for an existing stable sender `deviceUUID`, the receiver replaces that
+sender's stored device entry and revokes the previously issued token before authorizing the new
+token. Re-pairing must not leave older credentials usable.
 
 ## Reconnection authentication
 
