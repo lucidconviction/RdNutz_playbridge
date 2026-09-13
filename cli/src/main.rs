@@ -224,6 +224,81 @@ async fn run(arguments: Vec<String>) -> Result<(), RunError> {
             }
             mcp::run().await.map_err(RunError::usage)
         }
+        "paired" => {
+            if arguments[1..]
+                .iter()
+                .any(|value| value == "--help" || value == "-h")
+            {
+                println!(
+                    "List saved PlayBridge receiver credentials.\n\nUsage:\n  playbridge paired --json"
+                );
+                return Ok(());
+            }
+            let paired = credentials::PlaybridgeCredentials::list().map_err(RunError::usage)?;
+            send::emit_json(&serde_json::json!({ "ok": true, "paired": paired }))
+                .map_err(|_| RunError::failed())
+        }
+        "forget" => {
+            if arguments[1..]
+                .iter()
+                .any(|value| value == "--help" || value == "-h")
+            {
+                println!(
+                    "Forget credentials held by this CLI sender only.\n\nUsage:\n  playbridge forget <uuid|name> --json\n  playbridge forget --all --json"
+                );
+                return Ok(());
+            }
+            let all = arguments[1..].iter().any(|value| value == "--all");
+            let selectors = arguments[1..]
+                .iter()
+                .filter(|value| value.as_str() != "--json" && value.as_str() != "--all")
+                .collect::<Vec<_>>();
+            let result = if all {
+                if !selectors.is_empty() {
+                    Err("--all cannot be combined with a device".into())
+                } else {
+                    credentials::PlaybridgeCredentials::forget_all()
+                }
+            } else if let [selector] = selectors.as_slice() {
+                credentials::PlaybridgeCredentials::forget(selector).map(|item| vec![item])
+            } else {
+                Err("forget requires one device selector or --all".into())
+            };
+            match result {
+                Ok(forgotten) => send::emit_json(&serde_json::json!({
+                    "ok": true,
+                    "forgotten": forgotten,
+                }))
+                .map_err(|_| RunError::failed()),
+                Err(error) => {
+                    let _ = send::emit_json(&serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    }));
+                    Err(RunError::failed())
+                }
+            }
+        }
+        "pair" => {
+            if arguments[1..]
+                .iter()
+                .any(|value| value == "--help" || value == "-h")
+            {
+                println!(
+                    "Pair with a PlayBridge receiver without casting media.\n\nUsage:\n  playbridge pair [device] --json [--pair-code <code>]\n  playbridge pair --device <id> --json"
+                );
+                return Ok(());
+            }
+            let args = parse_pair_args(&arguments[1..]).map_err(RunError::usage)?;
+            send::run_json_pair(
+                args.device,
+                args.pair_code,
+                args.pair_code_file,
+                args.session_id,
+            )
+            .await
+            .map_err(|_| RunError::failed())
+        }
         "status" => {
             if arguments[1..]
                 .iter()
@@ -453,6 +528,76 @@ struct SendArgs {
     pair_code_file: Option<String>,
     session_id: Option<String>,
     skip_history: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PairArgs {
+    device: Option<String>,
+    pair_code: Option<String>,
+    pair_code_file: Option<String>,
+    session_id: Option<String>,
+}
+
+fn parse_pair_args(arguments: &[String]) -> Result<PairArgs, String> {
+    let mut device = None;
+    let mut pair_code = None;
+    let mut pair_code_file = None;
+    let mut session_id = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let target = match arguments[index].as_str() {
+            "--json" => None,
+            "--device" | "--pair-code" | "--pair-code-file" | "--session-id" => {
+                let option = arguments[index].clone();
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| format!("{option} requires a value"))?
+                    .clone();
+                match option.as_str() {
+                    "--device" => device = Some(value),
+                    "--pair-code" => pair_code = Some(value),
+                    "--pair-code-file" => pair_code_file = Some(value),
+                    _ => session_id = Some(value),
+                }
+                None
+            }
+            value if value.starts_with("--device=") => {
+                device = Some(value[9..].to_owned());
+                None
+            }
+            value if value.starts_with("--pair-code=") => {
+                pair_code = Some(value[12..].to_owned());
+                None
+            }
+            value if value.starts_with("--pair-code-file=") => {
+                pair_code_file = Some(value[17..].to_owned());
+                None
+            }
+            value if value.starts_with("--session-id=") => {
+                session_id = Some(value[13..].to_owned());
+                None
+            }
+            value if value.starts_with('-') => return Err(format!("unknown pair option: {value}")),
+            value => Some(value.to_owned()),
+        };
+        if let Some(target) = target {
+            if device.is_some() {
+                return Err("pair accepts a single device".into());
+            }
+            device = Some(target);
+        }
+        index += 1;
+    }
+    if pair_code.is_some() && pair_code_file.is_some() {
+        return Err("--pair-code and --pair-code-file cannot be combined".into());
+    }
+    Ok(PairArgs {
+        device,
+        pair_code,
+        pair_code_file,
+        session_id,
+    })
 }
 
 fn parse_send_args(arguments: &[String]) -> Result<SendArgs, String> {
@@ -732,6 +877,10 @@ Dashboard Commands:
 Machine Commands:
   send|cast <filename|URL> --json   Cast to the preferred receiver and print JSON events
   mcp                               Run a stdio MCP server for AI agents
+  paired --json                     List this sender's saved receiver credentials
+  forget <uuid|name> --json         Forget one receiver credential locally
+  forget --all --json               Forget all receiver credentials locally
+  pair [device] --json              Pair with a PlayBridge receiver without casting
   status [--json] [--session-id]    Print status of a JSON send session
   control <pause|play|toggle|stop|seek|volume|mute|speed> [--json]
                                     Control the active JSON send session
@@ -762,6 +911,12 @@ Send Options:
       --session-id <id>           Address one machine-mode cast session
       --skip-history              Do not save this cast to receiver history
       --save-history              Save this cast, overriding the configured default
+
+Pair Options:
+      --device <id>               PlayBridge receiver id, uuid, name, or address
+      --pair-code <code>          SAS code shown by the receiver
+      --pair-code-file <path>     Wait for that file to contain the SAS code
+      --session-id <id>           Identify an agent-managed pairing operation
 
 Discover Options:
   -p, --protocol <names>           playbridge, native, dlna, roku, dial, googlecast,
@@ -798,6 +953,29 @@ mod tests {
         let args = parse_discover_args(&[]).unwrap();
         assert_eq!(args.protocols, HashSet::from(ReceiverProtocol::DEFAULTS));
         assert_eq!(args.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_pair_args_supports_agent_managed_pairing() {
+        let args = parse_pair_args(&strings(&[
+            "playbridge:tv-id",
+            "--pair-code-file",
+            "/tmp/code",
+            "--session-id=session-1",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(args.device.as_deref(), Some("playbridge:tv-id"));
+        assert_eq!(args.pair_code_file.as_deref(), Some("/tmp/code"));
+        assert_eq!(args.session_id.as_deref(), Some("session-1"));
+        assert!(parse_pair_args(&strings(&["one", "two"])).is_err());
+        assert!(
+            parse_pair_args(&strings(&[
+                "--pair-code=123456",
+                "--pair-code-file=/tmp/code",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

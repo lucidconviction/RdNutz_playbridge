@@ -323,6 +323,7 @@ class ServerService : Service() {
                 isTokenAuthorized = { token -> pairingStore.isTokenAuthorized(token) },
                 onPairingApproved = { deviceName, deviceUUID ->
                     val newToken = java.util.UUID.randomUUID().toString()
+                    val receiverUUID = pairingStore.getOrCreateDeviceId()
                     pairingStore.addAuthorizedPairedDevice(
                         com.playbridge.player.model.PairedDevice(
                             id = java.util.UUID.randomUUID().toString(),
@@ -330,6 +331,7 @@ class ServerService : Service() {
                             deviceUUID = deviceUUID,
                         ),
                         newToken,
+                        legacyDeviceUUID = receiverUUID,
                     )
                     newToken
                 },

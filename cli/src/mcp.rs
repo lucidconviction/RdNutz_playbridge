@@ -27,12 +27,14 @@ Workflow:
 4. If send returns error pairing_required, ask the user for the six-digit code shown on the receiver, then call submit_pair_code with that session_id. It waits for the real pairing result.
 5. Use status to inspect playback and control to pause, play, seek, or stop.
 
+Use list_paired, forget, and pair to manage this CLI sender's local receiver credentials. These tools never revoke another sender from the receiver.
+
 send.skip_history overrides whether a PlayBridge receiver saves a cast in history. Omit it to use the persisted CLI default.
 
 Do not invent playbridge CLI flags. Use these tools. seek seconds are relative (e.g. 60 or -10).";
 
 pub fn usage() -> &'static str {
-    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, submit_pair_code, status, control\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
+    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, list_paired, forget, pair, submit_pair_code, status, control\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
 }
 
 #[derive(Clone)]
@@ -78,6 +80,22 @@ struct ToolOutput {
     capabilities: Option<CapabilitiesOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skip_history: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired: Option<Vec<PairedOutput>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forgotten: Option<Vec<PairedOutput>>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct PairedOutput {
+    uuid: String,
+    name: Option<String>,
+    last_used_at: Option<u64>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -141,6 +159,26 @@ struct PairCodeParams {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PairParams {
+    /// PlayBridge receiver id, UUID, name, or IP. Omit to use the preferred receiver.
+    #[serde(default)]
+    device: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ForgetParams {
+    /// Exact receiver UUID/id or an unambiguous saved receiver name.
+    #[serde(default)]
+    device: Option<String>,
+    /// Forget every credential stored by this CLI sender. Must be explicitly true.
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct ListPairedParams {}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct StatusParams {
     /// Session id returned by send. Defaults to this MCP server's managed send.
@@ -192,6 +230,75 @@ impl PlaybridgeMcp {
             args.push(protocol);
         }
         json_result(run_json_command(&args).await)
+    }
+
+    #[tool(
+        description = "List receivers paired with this CLI sender. Returns metadata only; tokens and certificate pins are never exposed.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn list_paired(
+        &self,
+        Parameters(_params): Parameters<ListPairedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        json_result(run_json_command(&["paired".into(), "--json".into()]).await)
+    }
+
+    #[tool(
+        description = "Forget credentials held by this CLI sender for one receiver, or all when all=true. This does not remove devices from the receiver's trust list.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn forget(
+        &self,
+        Parameters(params): Parameters<ForgetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["forget".into(), "--json".into()];
+        if params.all && params.device.is_some() {
+            return json_result(Ok(serde_json::json!({
+                "ok": false,
+                "error": "invalid_arguments",
+                "message": "all=true cannot be combined with device",
+            })));
+        } else if params.all {
+            args.push("--all".into());
+        } else if let Some(device) = params.device.filter(|value| !value.trim().is_empty()) {
+            args.push(device);
+        } else {
+            return json_result(Ok(serde_json::json!({
+                "ok": false,
+                "error": "invalid_arguments",
+                "message": "forget requires device or all=true",
+            })));
+        }
+        json_result(run_json_command(&args).await)
+    }
+
+    #[tool(
+        description = "Pair this CLI sender with a PlayBridge receiver without casting media. If pairing_required is returned, ask the user for the receiver's six-digit code and call submit_pair_code.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn pair(
+        &self,
+        Parameters(params): Parameters<PairParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_id = JsonCastSession::generate_id();
+        let pair_path = JsonCastSession::pair_code_path(&session_id).map_err(internal)?;
+        if let Some(parent) = pair_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&pair_path);
+        let mut args = vec![
+            "pair".into(),
+            "--json".into(),
+            "--pair-code-file".into(),
+            pair_path.to_string_lossy().into_owned(),
+            "--session-id".into(),
+            session_id.clone(),
+        ];
+        if let Some(device) = params.device.filter(|value| !value.trim().is_empty()) {
+            args.push("--device".into());
+            args.push(device);
+        }
+        self.start_managed(args, session_id).await
     }
 
     #[tool(
@@ -412,6 +519,52 @@ impl PlaybridgeMcp {
         }
         slot.as_ref().map(|managed| managed.session_id.clone())
     }
+
+    async fn start_managed(
+        &self,
+        args: Vec<String>,
+        session_id: String,
+    ) -> Result<CallToolResult, McpError> {
+        let mut slot = self.send_child.lock().await;
+        if let Some(previous) = slot.take() {
+            stop_managed(previous).await;
+        }
+        let mut child = spawn_playbridge(&args).map_err(internal)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::internal_error("managed command child has no stdout", None))?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(drain_reader(BufReader::new(stderr)));
+        }
+        let mut reader = BufReader::new(stdout);
+        let first =
+            match tokio::time::timeout(Duration::from_secs(30), read_json_value(&mut reader)).await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return json_result(Err(error));
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return json_result(Err("timed out waiting for pair result".into()));
+                }
+            };
+        if first.get("error").and_then(Value::as_str) == Some("pairing_required") {
+            *slot = Some(ManagedSend {
+                child,
+                stdout: reader,
+                session_id,
+                waiting_for_pairing: true,
+            });
+        } else {
+            let _ = child.wait().await;
+        }
+        json_result(Ok(first))
+    }
 }
 
 #[tool_handler]
@@ -567,7 +720,16 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        for expected in ["discover", "send", "submit_pair_code", "status", "control"] {
+        for expected in [
+            "discover",
+            "send",
+            "list_paired",
+            "forget",
+            "pair",
+            "submit_pair_code",
+            "status",
+            "control",
+        ] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected} in {names:?}"
