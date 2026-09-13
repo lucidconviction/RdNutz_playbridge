@@ -3,12 +3,6 @@
 Covers both APKs in this tree: the **player** (`com.playbridge.player`) and the **GeckoView plugin** (`com.playbridge.geckoview.plugin`).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Player [0.14.1] — 2026-09-13 (versionCode 231)
-
-### Security
-- **Re-pairing credential rotation**: Replace the existing device record and
-  revoke its previous token when the same stable sender identity pairs again.
-
 ## Player [0.14.0] — 2026-09-12 (versionCode 230)
 
 ### Added
@@ -17,6 +11,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - **Pairing navigation reliability**: Keep Connect selected after a pairing denial, timeout, or stale completion, including when another sender remains connected.
 - **Pairing responsiveness**: Remove the receiver-side pairing launch cooldown so a new request is handled immediately.
+
+### Security
+- **Re-pairing credential rotation**: Replace the existing device record and
+  revoke its previous token when the same stable sender identity pairs again.
 
 ## Player [0.13.1] — 2026-08-29 (versionCode 229)
 

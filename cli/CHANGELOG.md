@@ -1,19 +1,15 @@
 # PlayBridge CLI Changelog
 
-## 0.4.0 (2026-09-13)
-
-- Add agent-friendly paired-receiver listing, local credential removal, and
-  standalone SAS pairing without starting media playback.
-- Persist a stable per-installation CLI sender identity with a normalized host
-  display name; safely report malformed local identity and credential records.
-- Add MCP `list_paired`, `forget`, and `pair` tools, while preserving strict
-  MCP SDK schema compatibility.
-
 ## 0.3.1 (2026-09-12)
 
 - Fix MCP output schemas for strict SDK clients, reject ambiguous receiver names
   with protocol-qualified choices, preserve media filenames as playback titles,
   and provide dedicated MCP and Google Cast help.
+- Add agent-friendly paired-receiver listing, local credential removal, and
+  standalone SAS pairing without starting media playback.
+- Persist a stable per-installation CLI sender identity with a normalized host
+  display name; safely report malformed local identity and credential records.
+- Add MCP `list_paired`, `forget`, and `pair` tools.
 
 ## 0.3.0 (2026-09-12)
 
