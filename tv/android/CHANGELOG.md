@@ -12,6 +12,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Pairing navigation reliability**: Keep Connect selected after a pairing denial, timeout, or stale completion, including when another sender remains connected.
 - **Pairing responsiveness**: Remove the receiver-side pairing launch cooldown so a new request is handled immediately.
 
+### Security
+- **Re-pairing credential rotation**: Replace the existing device record and
+  revoke its previous token when the same stable sender identity pairs again.
+
 ## Player [0.13.1] — 2026-08-29 (versionCode 229)
 
 ### Fixed
