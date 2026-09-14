@@ -86,8 +86,26 @@ pub enum ReceiverFrame {
         #[serde(default)]
         media_kind: Option<String>,
     },
+    #[serde(rename = "playlist_status", rename_all = "camelCase")]
+    PlaylistStatus {
+        #[serde(default)]
+        items: Vec<PlaylistStatusItem>,
+        #[serde(default)]
+        current_index: usize,
+        #[serde(default)]
+        total_count: usize,
+    },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistStatusItem {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -478,6 +496,19 @@ mod tests {
             decode_receiver_text(r#"{"type":"future_event","value":1}"#).unwrap(),
             ReceiverFrame::Unknown
         );
+
+        let playlist = decode_receiver_text(
+            r#"{"type":"playlist_status","items":[{"index":1,"title":"Episode 2","future":true}],"currentIndex":1,"totalCount":2}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            playlist,
+            ReceiverFrame::PlaylistStatus {
+                current_index: 1,
+                total_count: 2,
+                items,
+            } if items[0].title == "Episode 2"
+        ));
     }
 
     #[test]

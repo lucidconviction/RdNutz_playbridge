@@ -170,6 +170,11 @@ async fn run(arguments: Vec<String>) -> Result<(), RunError> {
             match parse_send_args(&arguments[1..]) {
                 Ok(args) => {
                     if machine {
+                        let media_payload = if args.media_payload_stdin {
+                            Some(send::MediaPayloadSource::Stdin)
+                        } else {
+                            args.media_payload_file.map(send::MediaPayloadSource::File)
+                        };
                         send::run_json_cast(
                             args.target,
                             args.device,
@@ -177,6 +182,7 @@ async fn run(arguments: Vec<String>) -> Result<(), RunError> {
                             args.pair_code_file,
                             args.session_id,
                             args.skip_history,
+                            media_payload,
                         )
                         .await
                         .map_err(|_| RunError::failed())
@@ -528,6 +534,8 @@ struct SendArgs {
     pair_code_file: Option<String>,
     session_id: Option<String>,
     skip_history: Option<bool>,
+    media_payload_file: Option<String>,
+    media_payload_stdin: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -607,6 +615,8 @@ fn parse_send_args(arguments: &[String]) -> Result<SendArgs, String> {
     let mut pair_code_file = None;
     let mut session_id = None;
     let mut skip_history = None;
+    let mut media_payload_file = None;
+    let mut media_payload_stdin = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -656,9 +666,22 @@ fn parse_send_args(arguments: &[String]) -> Result<SendArgs, String> {
                         .clone(),
                 );
             }
+            "--media-payload-file" => {
+                index += 1;
+                media_payload_file = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("--media-payload-file requires a value")?
+                        .clone(),
+                );
+            }
             value if value.starts_with("--session-id=") => {
                 session_id = Some(value["--session-id=".len()..].to_owned());
             }
+            value if value.starts_with("--media-payload-file=") => {
+                media_payload_file = Some(value["--media-payload-file=".len()..].to_owned());
+            }
+            "--media-payload-stdin" => media_payload_stdin = true,
             "--skip-history" => {
                 if skip_history == Some(false) {
                     return Err("--skip-history and --save-history cannot be combined".into());
@@ -686,6 +709,9 @@ fn parse_send_args(arguments: &[String]) -> Result<SendArgs, String> {
     if pair_code.is_some() && pair_code_file.is_some() {
         return Err("--pair-code and --pair-code-file cannot be combined".into());
     }
+    if media_payload_stdin && media_payload_file.is_some() {
+        return Err("--media-payload-stdin and --media-payload-file cannot be combined".into());
+    }
     Ok(SendArgs {
         target: target.ok_or_else(|| "missing media file or URL to send".to_owned())?,
         device,
@@ -693,6 +719,8 @@ fn parse_send_args(arguments: &[String]) -> Result<SendArgs, String> {
         pair_code_file,
         session_id,
         skip_history,
+        media_payload_file,
+        media_payload_stdin,
     })
 }
 
@@ -882,7 +910,7 @@ Machine Commands:
   forget --all --json               Forget all receiver credentials locally
   pair [device] --json              Pair with a PlayBridge receiver without casting
   status [--json] [--session-id]    Print status of a JSON send session
-  control <pause|play|toggle|stop|seek|volume|mute|speed> [--json]
+  control <pause|play|toggle|stop|seek|volume|mute|loop|speed|audio_boost> [--json]
                                     Control the active JSON send session
   discover --json                   Print one final discovery report
   discover --json-lines             Stream discovery events
@@ -1025,7 +1053,11 @@ mod tests {
         assert!(help.contains("send|cast <filename|URL> --json"));
         assert!(help.contains("mcp"));
         assert!(help.contains("status [--json]"));
-        assert!(help.contains("control <pause|play|toggle|stop|seek|volume|mute|speed>"));
+        assert!(
+            help.contains(
+                "control <pause|play|toggle|stop|seek|volume|mute|loop|speed|audio_boost>"
+            )
+        );
         assert!(help.contains("Interactive workflows require a terminal"));
     }
 
@@ -1080,6 +1112,19 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(scoped.session_id.as_deref(), Some("agent-123"));
+
+        let stdin_payload =
+            parse_send_args(&strings(&["video.mp4", "--json", "--media-payload-stdin"])).unwrap();
+        assert!(stdin_payload.media_payload_stdin);
+        assert!(
+            parse_send_args(&strings(&[
+                "video.mp4",
+                "--media-payload-stdin",
+                "--media-payload-file",
+                "/tmp/payload.json",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
