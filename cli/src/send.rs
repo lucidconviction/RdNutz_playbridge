@@ -16,13 +16,13 @@ use playbridge_cast_core::{
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env,
+    env, fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Duration,
 };
 use stream_proxy_rust::{ProxyServer, ProxyServerConfig};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::{
     credentials::{PlaybridgeCredentials, SenderIdentity, now_seconds},
@@ -47,6 +47,8 @@ pub(crate) struct CastSnapshot {
     pub title: String,
     pub position_ms: u64,
     pub duration_ms: u64,
+    pub current_index: Option<usize>,
+    pub total_count: Option<usize>,
     pub volume: Option<f32>,
     pub muted: Option<bool>,
     pub looping: Option<bool>,
@@ -115,6 +117,7 @@ struct PlaybridgeLoad<'a> {
     media_url: &'a str,
     media_title: &'a str,
     skip_history: bool,
+    playlist_payload: Option<&'a Value>,
     pair_only: bool,
 }
 
@@ -122,8 +125,252 @@ struct PlaybridgeLoad<'a> {
 struct JsonStatusContext<'a> {
     session_id: &'a str,
     receiver: &'a Receiver,
-    media: &'a str,
+    media_items: &'a [String],
     capabilities: &'a CastCapabilities,
+}
+
+struct JsonSessionInput {
+    media_items: Vec<String>,
+    initial_index: usize,
+    stdin_commands: bool,
+}
+
+pub(crate) enum MediaPayloadSource {
+    File(String),
+    Stdin,
+}
+
+async fn read_playlist_payload(
+    source: Option<&MediaPayloadSource>,
+    fallback_url: &str,
+    fallback_title: &str,
+) -> Result<Value, String> {
+    let Some(source) = source else {
+        return Ok(json!({
+            "items": [{ "url": fallback_url, "title": fallback_title }],
+            "startIndex": 0,
+        }));
+    };
+    const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
+    let data = match source {
+        MediaPayloadSource::File(path) => {
+            let metadata =
+                fs::metadata(path).map_err(|_| "could not read media payload".to_owned())?;
+            if metadata.len() > MAX_PAYLOAD_BYTES {
+                return Err("media payload exceeds 256 KiB".into());
+            }
+            fs::read_to_string(path).map_err(|_| "could not read media payload".to_owned())?
+        }
+        MediaPayloadSource::Stdin => {
+            let mut data = String::new();
+            BufReader::new(tokio::io::stdin())
+                .take(MAX_PAYLOAD_BYTES + 1)
+                .read_line(&mut data)
+                .await
+                .map_err(|_| "could not read media payload from stdin".to_owned())?;
+            if data.len() as u64 > MAX_PAYLOAD_BYTES {
+                return Err("media payload exceeds 256 KiB".into());
+            }
+            data
+        }
+    };
+    let payload: Value =
+        serde_json::from_str(&data).map_err(|_| "invalid media payload".to_owned())?;
+    if payload.is_null() {
+        return Ok(json!({
+            "items": [{ "url": fallback_url, "title": fallback_title }],
+            "startIndex": 0,
+        }));
+    }
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("media payload requires items")?;
+    if items.is_empty() || items.len() > 256 {
+        return Err("media payload requires between 1 and 256 items".into());
+    }
+    for item in items {
+        let url = item.get("url").and_then(Value::as_str).unwrap_or_default();
+        validate_media_target(url)?;
+    }
+    Ok(payload)
+}
+
+fn apply_history_default(payload: &mut Value, skip_history: bool) {
+    if let Some(items) = payload.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("skipHistory").is_none_or(Value::is_null)
+                && let Some(object) = item.as_object_mut()
+            {
+                object.insert("skipHistory".into(), json!(skip_history));
+            }
+        }
+    }
+}
+
+fn selected_playlist_item(payload: &Value) -> Result<&Value, String> {
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("media payload requires items")?;
+    let start_index = playlist_start_index(payload)?;
+    items
+        .get(start_index)
+        .ok_or_else(|| "media payload startIndex must select an item".to_owned())
+}
+
+fn playlist_start_index(payload: &Value) -> Result<usize, String> {
+    let index = payload
+        .get("startIndex")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| "media payload startIndex must be a non-negative integer".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(index)
+}
+
+async fn prepare_json_playlist(
+    mut payload: Value,
+    receiver: &Receiver,
+) -> Result<(Value, Option<ProxyServer>), String> {
+    let items = payload
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or("media payload requires items")?;
+    if receiver.protocol != ReceiverProtocol::PlayBridge && items.len() != 1 {
+        return Err("multi-item playlists require a PlayBridge receiver".into());
+    }
+    let needs_proxy = items.iter().any(|item| {
+        let url = item.get("url").and_then(Value::as_str).unwrap_or_default();
+        resolve_media_path(url).is_file()
+            || (receiver.protocol != ReceiverProtocol::PlayBridge
+                && item
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .is_some_and(|headers| !headers.is_empty()))
+    });
+    let server = if needs_proxy {
+        Some(ProxyServer::start(ProxyServerConfig::default()).await?)
+    } else {
+        None
+    };
+    let host = match server.as_ref() {
+        Some(server) => Some(primary_lan_host(server.local_addr().port())?),
+        None => None,
+    };
+    for item in items {
+        let url = item["url"]
+            .as_str()
+            .ok_or("media item is missing url")?
+            .to_owned();
+        let path = resolve_media_path(&url);
+        let proxied = if path.is_file() {
+            let content_type = item
+                .get("contentType")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Some(
+                server
+                    .as_ref()
+                    .expect("local media requires proxy")
+                    .register_file(
+                        host.as_deref().expect("proxy host exists"),
+                        path,
+                        content_type,
+                        Duration::from_secs(6 * 60 * 60),
+                    )?
+                    .url,
+            )
+        } else if receiver.protocol != ReceiverProtocol::PlayBridge {
+            let headers = item
+                .get("headers")
+                .and_then(Value::as_object)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_owned()))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            if headers.is_empty() {
+                None
+            } else {
+                let content_type = item.get("contentType").and_then(Value::as_str);
+                let origins = item
+                    .get("allowedPrivateOrigins")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(
+                    server
+                        .as_ref()
+                        .expect("headered media requires proxy")
+                        .register_remote_with_policy(
+                            host.as_deref().expect("proxy host exists"),
+                            url,
+                            headers,
+                            content_type,
+                            origins,
+                        )?
+                        .url,
+                )
+            }
+        } else {
+            None
+        };
+        if let Some(url) = proxied {
+            item["url"] = json!(url);
+            if let Some(object) = item.as_object_mut() {
+                object.remove("headers");
+            }
+        }
+    }
+    Ok((payload, server))
+}
+
+async fn prepare_queue_item(
+    payload: &mut Value,
+    proxy_server: &mut Option<ProxyServer>,
+) -> Result<(), String> {
+    let item = payload
+        .get_mut("item")
+        .and_then(Value::as_object_mut)
+        .ok_or("queue_add requires item")?;
+    let url = item
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("queue item is missing url")?
+        .to_owned();
+    let path = resolve_media_path(&url);
+    if !path.is_file() {
+        return Ok(());
+    }
+    if proxy_server.is_none() {
+        *proxy_server = Some(ProxyServer::start(ProxyServerConfig::default()).await?);
+    }
+    let server = proxy_server.as_ref().expect("queue proxy exists");
+    let host = primary_lan_host(server.local_addr().port())?;
+    let content_type = item
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let media =
+        server.register_file(&host, path, content_type, Duration::from_secs(6 * 60 * 60))?;
+    item.insert("url".into(), json!(media.url));
+    item.remove("headers");
+    Ok(())
 }
 
 /// Casts without the dashboard and prints one JSON object. Stays running until
@@ -139,6 +386,7 @@ pub(crate) async fn run_json_cast(
     pair_code_file: Option<String>,
     requested_session_id: Option<String>,
     skip_history_override: Option<bool>,
+    media_payload: Option<MediaPayloadSource>,
 ) -> Result<(), String> {
     if let Err(message) = validate_media_target(&media_target) {
         emit_json(&json!({
@@ -150,6 +398,14 @@ pub(crate) async fn run_json_cast(
     }
 
     let skip_history = skip_history_override.unwrap_or(crate::ui::skip_history_default()?);
+    let stdin_commands = matches!(media_payload, Some(MediaPayloadSource::Stdin));
+    let mut playlist_payload = read_playlist_payload(
+        media_payload.as_ref(),
+        &media_target,
+        &media_title(&media_target).unwrap_or_else(|| "Untitled media".into()),
+    )
+    .await?;
+    apply_history_default(&mut playlist_payload, skip_history);
     let session_id = requested_session_id.unwrap_or_else(JsonCastSession::generate_id);
     let session = match JsonCastSession::claim(&session_id) {
         Ok(session) => session,
@@ -168,18 +424,24 @@ pub(crate) async fn run_json_cast(
         Ok(receiver) => receiver,
         Err(error) => return Err(error),
     };
-    let title = media_title(&media_target).unwrap_or_else(|| "Untitled media".into());
+    let selected_item = selected_playlist_item(&playlist_payload)?;
+    let selected_url = selected_item
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("media item is missing url")?;
+    let title = selected_item
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| media_title(selected_url).unwrap_or_else(|| "Untitled media".into()));
 
-    let resolved_path = resolve_media_path(&media_target);
-    let (media_url, proxy_server) = if resolved_path.is_file() {
-        let server = ProxyServer::start(ProxyServerConfig::default()).await?;
-        let host = primary_lan_host(server.local_addr().port())?;
-        let media =
-            server.register_file(&host, resolved_path, None, Duration::from_secs(6 * 60 * 60))?;
-        (media.url, Some(server))
-    } else {
-        (media_target, None)
-    };
+    let raw_playlist_payload = playlist_payload.clone();
+    let (mut playlist_payload, mut proxy_server) =
+        prepare_json_playlist(playlist_payload, &receiver).await?;
+    let mut media_url = selected_playlist_item(&playlist_payload)?["url"]
+        .as_str()
+        .ok_or("media item is missing url")?
+        .to_owned();
 
     let pair_code_path = pair_code_file.as_deref().map(PathBuf::from);
     let pairing = MachinePairing {
@@ -188,7 +450,7 @@ pub(crate) async fn run_json_cast(
         session_id: &session_id,
     };
     let (receiver, control) =
-        match connect_and_load(&media_url, &title, receiver, pairing, skip_history).await {
+        match connect_and_load(&media_url, &title, &playlist_payload, receiver, pairing).await {
             Ok(connected) => connected,
             Err(message) if !explicit_device && is_unreachable(&message) => {
                 match select_discovered_receiver(
@@ -199,10 +461,27 @@ pub(crate) async fn run_json_cast(
                 .await
                 {
                     Ok(fallback) => {
-                        match connect_and_load(&media_url, &title, fallback, pairing, skip_history)
-                            .await
+                        let (fallback_payload, fallback_proxy) =
+                            prepare_json_playlist(raw_playlist_payload.clone(), &fallback).await?;
+                        let fallback_url = selected_playlist_item(&fallback_payload)?["url"]
+                            .as_str()
+                            .ok_or("media item is missing url")?
+                            .to_owned();
+                        match connect_and_load(
+                            &fallback_url,
+                            &title,
+                            &fallback_payload,
+                            fallback,
+                            pairing,
+                        )
+                        .await
                         {
-                            Ok(connected) => connected,
+                            Ok(connected) => {
+                                playlist_payload = fallback_payload;
+                                media_url = fallback_url;
+                                proxy_server = fallback_proxy;
+                                connected
+                            }
                             Err(message) => {
                                 emit_connect_error(&message, &session_id)?;
                                 return Err(message);
@@ -219,6 +498,15 @@ pub(crate) async fn run_json_cast(
         };
 
     let _ = save_receiver_as_preferred(&receiver);
+    let media_items = playlist_payload
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("url").and_then(Value::as_str))
+        .map(display_media_target)
+        .collect::<Vec<_>>();
+    let initial_index = playlist_start_index(&playlist_payload)?;
     let media = display_media_target(&media_url);
     session.activate(&SessionInfo {
         session_id: session_id.clone(),
@@ -246,7 +534,19 @@ pub(crate) async fn run_json_cast(
         );
     }
 
-    let result = json_session_loop(control, receiver, capabilities, media, &session).await;
+    let result = json_session_loop(
+        control,
+        receiver,
+        capabilities,
+        JsonSessionInput {
+            media_items,
+            initial_index,
+            stdin_commands,
+        },
+        &session,
+        &mut proxy_server,
+    )
+    .await;
     if let Some(server) = proxy_server
         && let Err(error) = server.shutdown().await
     {
@@ -282,6 +582,7 @@ pub(crate) async fn run_json_pair(
         .ok_or_else(|| format!("{} has no reachable address", receiver.name))?;
     let uuid = receiver_uuid(&receiver);
     let was_paired = PlaybridgeCredentials::load(&uuid).is_some();
+    let empty_payload = json!({ "items": [] });
     let pair_path = pair_code_file.as_deref().map(PathBuf::from);
     let socket = cast_to_playbridge_maybe_pair(
         &address,
@@ -292,6 +593,7 @@ pub(crate) async fn run_json_pair(
             media_url: "",
             media_title: "",
             skip_history: false,
+            playlist_payload: Some(&empty_payload),
             pair_only: true,
         },
         MachinePairing {
@@ -342,26 +644,31 @@ async fn json_session_loop(
     mut control: TargetControl,
     receiver: Receiver,
     capabilities: CastCapabilities,
-    media: String,
+    input: JsonSessionInput,
     session: &JsonCastSession,
+    proxy_server: &mut Option<ProxyServer>,
 ) -> Result<(), String> {
+    let JsonSessionInput {
+        mut media_items,
+        initial_index,
+        mut stdin_commands,
+    } = input;
     let mut snapshot = CastSnapshot {
         state: "buffering".into(),
         title: receiver.name.clone(),
         position_ms: 0,
         duration_ms: 0,
+        current_index: Some(initial_index),
+        total_count: Some(media_items.len()),
         volume: capabilities.volume.then_some(0.5),
         muted: capabilities.mute.then_some(false),
         looping: capabilities.looping.then_some(false),
         speed: capabilities.speed.then_some(1.0),
     };
-    let status_context = JsonStatusContext {
-        session_id: session.id(),
-        receiver: &receiver,
-        media: &media,
-        capabilities: &capabilities,
-    };
-    session.write_status(&status_json(status_context, &snapshot))?;
+    session.write_status(&status_json(
+        json_status_context(session, &receiver, &media_items, &capabilities),
+        &snapshot,
+    ))?;
     let mut last_control_id = String::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -370,6 +677,26 @@ async fn json_session_loop(
     loop {
         tokio::select! {
             _ = wait_interrupt() => break,
+            request = read_stdin_control_request(), if stdin_commands => {
+                match request? {
+                    Some(request) => {
+                        if process_json_request(
+                            &mut control,
+                            &mut snapshot,
+                            &request,
+                            proxy_server,
+                            &mut media_items,
+                            session,
+                            &receiver,
+                            &capabilities,
+                            true,
+                        ).await {
+                            break;
+                        }
+                    }
+                    None => stdin_commands = false,
+                }
+            }
             _ = tick.tick() => {
                 poll_count = poll_count.wrapping_add(1);
                 if poll_count.is_multiple_of(4) {
@@ -388,41 +715,23 @@ async fn json_session_loop(
                 }
                 if let Some(request) = session.take_request(&last_control_id) {
                     last_control_id = request.id.clone();
-                    match apply_json_control(&mut control, &mut snapshot, &request).await {
-                        Ok(JsonControlResult::Stop) => {
-                            snapshot.state = "stopped".into();
-                            let _ = session.write_ack(&control_ack(
-                                status_context,
-                                &request,
-                                true,
-                                None,
-                                &snapshot,
-                            ));
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            break;
-                        }
-                        Ok(JsonControlResult::Applied) => {
-                            let _ = session.write_ack(&control_ack(
-                                status_context,
-                                &request,
-                                true,
-                                None,
-                                &snapshot,
-                            ));
-                        }
-                        Err(message) => {
-                            let _ = session.write_ack(&control_ack(
-                                status_context,
-                                &request,
-                                false,
-                                Some(&message),
-                                &snapshot,
-                            ));
-                        }
+                    if process_json_request(
+                        &mut control,
+                        &mut snapshot,
+                        &request,
+                        proxy_server,
+                        &mut media_items,
+                        session,
+                        &receiver,
+                        &capabilities,
+                        false,
+                    ).await {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        break;
                     }
                 }
                 let _ = session.write_status(&status_json(
-                    status_context,
+                    json_status_context(session, &receiver, &media_items, &capabilities),
                     &snapshot,
                 ));
             }
@@ -432,7 +741,78 @@ async fn json_session_loop(
     Ok(())
 }
 
+async fn read_stdin_control_request() -> Result<Option<ControlRequest>, String> {
+    const MAX_COMMAND_BYTES: u64 = 256 * 1024;
+    let mut line = String::new();
+    let read = BufReader::new(tokio::io::stdin())
+        .take(MAX_COMMAND_BYTES + 1)
+        .read_line(&mut line)
+        .await
+        .map_err(|error| format!("could not read MCP control command: {error}"))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() as u64 > MAX_COMMAND_BYTES {
+        return Err("MCP control command exceeds 256 KiB".into());
+    }
+    serde_json::from_str(&line)
+        .map(Some)
+        .map_err(|error| format!("invalid MCP control command: {error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_json_request(
+    control: &mut TargetControl,
+    snapshot: &mut CastSnapshot,
+    request: &ControlRequest,
+    proxy_server: &mut Option<ProxyServer>,
+    media_items: &mut Vec<String>,
+    session: &JsonCastSession,
+    receiver: &Receiver,
+    capabilities: &CastCapabilities,
+    emit_response: bool,
+) -> bool {
+    let result = apply_json_control(control, snapshot, request, proxy_server, media_items).await;
+    if matches!(result, Ok(JsonControlResult::Stop)) {
+        snapshot.state = "stopped".into();
+    }
+    let (ok, error) = match &result {
+        Ok(_) => (true, None),
+        Err(message) => (false, Some(message.as_str())),
+    };
+    let ack = control_ack(
+        json_status_context(session, receiver, media_items, capabilities),
+        request,
+        ok,
+        error,
+        snapshot,
+    );
+    let _ = session.write_ack(&ack);
+    if emit_response {
+        let _ = emit_json(&ack);
+    }
+    matches!(result, Ok(JsonControlResult::Stop))
+}
+
+fn json_status_context<'a>(
+    session: &'a JsonCastSession,
+    receiver: &'a Receiver,
+    media_items: &'a [String],
+    capabilities: &'a CastCapabilities,
+) -> JsonStatusContext<'a> {
+    JsonStatusContext {
+        session_id: session.id(),
+        receiver,
+        media_items,
+        capabilities,
+    }
+}
+
 fn status_json(context: JsonStatusContext<'_>, snapshot: &CastSnapshot) -> Value {
+    let media = match snapshot.current_index {
+        Some(index) => context.media_items.get(index),
+        None => context.media_items.first(),
+    };
     json!({
         "ok": true,
         "session_id": context.session_id,
@@ -440,11 +820,13 @@ fn status_json(context: JsonStatusContext<'_>, snapshot: &CastSnapshot) -> Value
         "device": context.receiver.name,
         "protocol": context.receiver.protocol.as_str(),
         "id": context.receiver.id.0,
-        "media": context.media,
+        "media": media,
         "state": snapshot.state,
         "title": snapshot.title,
         "position_ms": snapshot.position_ms,
         "duration_ms": snapshot.duration_ms,
+        "current_index": snapshot.current_index,
+        "total_count": snapshot.total_count,
         "volume": snapshot.volume,
         "muted": snapshot.muted,
         "looping": snapshot.looping,
@@ -479,9 +861,48 @@ async fn apply_json_control(
     control: &mut TargetControl,
     snapshot: &mut CastSnapshot,
     request: &ControlRequest,
+    proxy_server: &mut Option<ProxyServer>,
+    media_items: &mut Vec<String>,
 ) -> Result<JsonControlResult, String> {
     match request.command.as_str() {
         "stop" => Ok(JsonControlResult::Stop),
+        "receiver_command" => {
+            let action = request
+                .action
+                .as_deref()
+                .ok_or("receiver command requires action")?;
+            let mut payload = request.payload.clone();
+            let queued_media = if action == "queue_add" {
+                payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("item"))
+                    .and_then(|item| item.get("url"))
+                    .and_then(Value::as_str)
+                    .map(display_media_target)
+            } else {
+                None
+            };
+            if action == "queue_add"
+                && let Some(payload) = payload.as_mut()
+            {
+                prepare_queue_item(payload, proxy_server).await?;
+            }
+            let TargetControl::Playbridge(socket) = control else {
+                return Err("receiver commands require a PlayBridge session".into());
+            };
+            socket
+                .send(&SenderFrame::Command {
+                    action: action.to_owned(),
+                    payload,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(media) = queued_media {
+                media_items.push(media);
+                snapshot.total_count = Some(media_items.len());
+            }
+            Ok(JsonControlResult::Applied)
+        }
         "pause" => {
             if snapshot.state != "paused" {
                 dashboard_control(control, CastCommand::PlayPause, snapshot).await?;
@@ -514,6 +935,14 @@ async fn apply_json_control(
         }
         "mute" => {
             dashboard_control(control, CastCommand::ToggleMute, snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "loop" => {
+            dashboard_control(control, CastCommand::ToggleLoop, snapshot).await?;
+            Ok(JsonControlResult::Applied)
+        }
+        "audio_boost" => {
+            dashboard_control(control, CastCommand::ToggleAudioBoost, snapshot).await?;
             Ok(JsonControlResult::Applied)
         }
         "speed" => {
@@ -948,9 +1377,9 @@ fn emit_connect_error(message: &str, session_id: &str) -> Result<(), String> {
 async fn connect_and_load(
     media_url: &str,
     media_title: &str,
+    playlist_payload: &Value,
     receiver: Receiver,
     pairing: MachinePairing<'_>,
-    skip_history: bool,
 ) -> Result<(Receiver, TargetControl), String> {
     let address = receiver
         .addresses
@@ -973,7 +1402,8 @@ async fn connect_and_load(
                         device_uuid: &uuid,
                         media_url,
                         media_title,
-                        skip_history,
+                        skip_history: false,
+                        playlist_payload: Some(playlist_payload),
                         pair_only: false,
                     },
                     pairing,
@@ -988,6 +1418,10 @@ async fn connect_and_load(
             receiver.location.as_deref(),
             media_url,
             media_title,
+            playlist_payload
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first()),
         )
         .await?
         .ok_or_else(|| format!("{} did not provide playback controls", receiver.name))?,
@@ -1122,13 +1556,7 @@ async fn cast_to_playbridge_maybe_pair(
                 };
                 credentials.save(load.device_uuid)?;
                 if !load.pair_only {
-                    send_playlist(
-                        &mut socket,
-                        load.media_url,
-                        load.media_title,
-                        load.skip_history,
-                    )
-                    .await?;
+                    send_load(&mut socket, load).await?;
                 }
                 return Ok(socket);
             }
@@ -1190,6 +1618,7 @@ pub(crate) async fn run_dashboard_cast(
                         media_url: &media_url,
                         media_title: &dashboard_title,
                         skip_history,
+                        playlist_payload: None,
                         pair_only: false,
                     },
                     DashboardPairing {
@@ -1208,6 +1637,7 @@ pub(crate) async fn run_dashboard_cast(
             target.location.as_deref(),
             &media_url,
             &dashboard_title,
+            None,
         )
         .await?
         .ok_or_else(|| format!("{} did not provide playback controls", target.name))?,
@@ -1219,6 +1649,8 @@ pub(crate) async fn run_dashboard_cast(
         title: dashboard_title,
         position_ms: 0,
         duration_ms: 0,
+        current_index: None,
+        total_count: None,
         volume: capabilities.volume.then_some(0.5),
         muted: capabilities.mute.then_some(false),
         looping: capabilities.looping.then_some(false),
@@ -1389,6 +1821,8 @@ pub(crate) async fn run_dashboard_browser_cast(
         title,
         position_ms: 0,
         duration_ms: 0,
+        current_index: None,
+        total_count: None,
         volume: Some(1.0),
         muted: Some(false),
         looping: None,
@@ -1629,20 +2063,33 @@ async fn dashboard_poll(
             while let Ok(Ok(Some(frame))) =
                 tokio::time::timeout(Duration::from_millis(10), socket.receive()).await
             {
-                if let ReceiverFrame::Status {
-                    state,
-                    position,
-                    duration,
-                    title,
-                    ..
-                } = frame
-                {
-                    snapshot.state = state;
-                    snapshot.position_ms = position;
-                    snapshot.duration_ms = duration;
-                    if let Some(title) = title {
-                        snapshot.title = title;
+                match frame {
+                    ReceiverFrame::Status {
+                        state,
+                        position,
+                        duration,
+                        title,
+                        ..
+                    } => {
+                        snapshot.state = state;
+                        snapshot.position_ms = position;
+                        snapshot.duration_ms = duration;
+                        if let Some(title) = title {
+                            snapshot.title = title;
+                        }
                     }
+                    ReceiverFrame::PlaylistStatus {
+                        items,
+                        current_index,
+                        total_count,
+                    } => {
+                        snapshot.current_index = Some(current_index);
+                        snapshot.total_count = Some(total_count);
+                        if let Some(item) = items.iter().find(|item| item.index == current_index) {
+                            snapshot.title = item.title.clone();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1957,7 +2404,24 @@ async fn cast_to_target(
     location: Option<&str>,
     media_url: &str,
     media_title: &str,
+    media_item: Option<&Value>,
 ) -> Result<Option<TargetControl>, String> {
+    let content_type = media_item
+        .and_then(|item| item.get("contentType"))
+        .and_then(Value::as_str);
+    let start_seconds = media_item
+        .and_then(|item| item.get("startPositionMs"))
+        .and_then(Value::as_u64)
+        .map_or(0.0, |milliseconds| milliseconds as f64 / 1000.0);
+    let art_url = media_item
+        .and_then(|item| item.get("visualMetadata"))
+        .and_then(|metadata| {
+            metadata
+                .get("artworkUrl")
+                .or_else(|| metadata.get("posterUrl"))
+                .or_else(|| metadata.get("backdropUrl"))
+        })
+        .and_then(Value::as_str);
     match protocol.to_lowercase().as_str() {
         "google_cast" | "googlecast" | "chromecast" => {
             let application_id = env::var("PLAYBRIDGE_GOOGLE_CAST_APP_ID")
@@ -1969,15 +2433,15 @@ async fn cast_to_target(
                 castv2::SessionLaunchStrategy::ForceRelaunch,
             )
             .await?;
-            let (content_type, stream_type) = castv2::media_format(media_url);
+            let (inferred_content_type, stream_type) = castv2::media_format(media_url);
             let media_session_id = castv2::load_media(
                 &mut details,
                 media_url,
-                Some(content_type),
+                content_type.or(Some(inferred_content_type)),
                 stream_type,
                 Some(media_title),
-                None,
-                0.0,
+                art_url,
+                start_seconds,
                 None,
                 None,
             )
@@ -2001,6 +2465,12 @@ async fn cast_to_target(
                 .await
                 .map_err(|error| error.to_string())?;
             renderer.play().await.map_err(|error| error.to_string())?;
+            if start_seconds > 0.0 {
+                renderer
+                    .seek(&format_time(start_seconds))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(Some(TargetControl::Dlna(renderer)))
         }
         "roku" => {
@@ -2008,6 +2478,9 @@ async fn cast_to_target(
                 .map_err(|error| error.to_string())?;
             let mut media = MediaRequest::new(media_url);
             media.title = Some(media_title.to_owned());
+            media.content_type = content_type.map(str::to_owned);
+            media.art_url = art_url.map(str::to_owned);
+            media.start_seconds = start_seconds;
             session
                 .load(&media)
                 .await
@@ -2056,13 +2529,7 @@ async fn cast_to_playbridge(
     credentials.save(load.device_uuid)?;
 
     if !load.pair_only {
-        send_playlist(
-            &mut socket,
-            load.media_url,
-            load.media_title,
-            load.skip_history,
-        )
-        .await?;
+        send_load(&mut socket, load).await?;
     }
     Ok(socket)
 }
@@ -2181,13 +2648,7 @@ async fn cast_to_playbridge_dashboard(
                     .await
                     .map_err(|_| "dashboard closed after pairing".to_owned())?;
                 if !load.pair_only {
-                    send_playlist(
-                        &mut socket,
-                        load.media_url,
-                        load.media_title,
-                        load.skip_history,
-                    )
-                    .await?;
+                    send_load(&mut socket, load).await?;
                 }
                 return Ok(socket);
             }
@@ -2201,17 +2662,19 @@ async fn cast_to_playbridge_dashboard(
     Err("Receiver closed connection before pairing completed".into())
 }
 
-async fn send_playlist(
-    socket: &mut SecureWebSocket,
-    media_url: &str,
-    media_title: &str,
-    skip_history: bool,
-) -> Result<(), String> {
+async fn send_load(socket: &mut SecureWebSocket, load: PlaybridgeLoad<'_>) -> Result<(), String> {
+    let command = if let Some(payload) = load.playlist_payload {
+        SenderFrame::Command {
+            action: "playlist".into(),
+            payload: Some(payload.clone()),
+        }
+    } else {
+        playlist_command(load.media_url, load.media_title, load.skip_history)
+    };
     socket
-        .send(&playlist_command(media_url, media_title, skip_history))
+        .send(&command)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 fn playlist_command(media_url: &str, media_title: &str, skip_history: bool) -> SenderFrame {
@@ -2231,6 +2694,26 @@ fn playlist_command(media_url: &str, media_title: &str, skip_history: bool) -> S
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn regular_payload_file_is_read_without_being_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let preserved = temp.path().join("preserved.json");
+        let payload = r#"{"items":[{"url":"https://example.test/video.mp4"}]}"#;
+        fs::write(&preserved, payload).unwrap();
+
+        read_playlist_payload(
+            Some(&MediaPayloadSource::File(
+                preserved.to_string_lossy().into_owned(),
+            )),
+            "unused",
+            "unused",
+        )
+        .await
+        .unwrap();
+
+        assert!(preserved.exists());
+    }
+
     #[test]
     fn playlist_command_sets_skip_history() {
         let SenderFrame::Command { payload, .. } =
@@ -2241,6 +2724,32 @@ mod tests {
         let item = &payload.unwrap()["items"][0];
         assert_eq!(item["title"], "video.mp4");
         assert_eq!(item["skipHistory"], true);
+    }
+
+    #[test]
+    fn selected_playlist_item_honors_start_index() {
+        let payload = json!({
+            "items": [
+                { "url": "https://example.test/one.mp4", "title": "One" },
+                { "url": "https://example.test/two.mp4", "title": "Two" }
+            ],
+            "startIndex": 1
+        });
+        let selected = selected_playlist_item(&payload).unwrap();
+        assert_eq!(selected["url"], "https://example.test/two.mp4");
+        assert_eq!(selected["title"], "Two");
+    }
+
+    #[test]
+    fn selected_playlist_item_rejects_an_out_of_range_start_index() {
+        let payload = json!({
+            "items": [{ "url": "https://example.test/one.mp4" }],
+            "startIndex": 1
+        });
+        assert_eq!(
+            selected_playlist_item(&payload).unwrap_err(),
+            "media payload startIndex must select an item"
+        );
     }
 
     #[test]
@@ -2377,6 +2886,8 @@ mod tests {
             title: "Video".into(),
             position_ms: 1000,
             duration_ms: 2000,
+            current_index: Some(0),
+            total_count: Some(1),
             volume: None,
             muted: None,
             looping: None,
@@ -2388,12 +2899,14 @@ mod tests {
             seconds: None,
             delta: None,
             value: None,
+            action: None,
+            payload: None,
         };
         let ack = control_ack(
             JsonStatusContext {
                 session_id: "session-1",
                 receiver: &receiver,
-                media: "video.mp4",
+                media_items: &["video.mp4".into()],
                 capabilities: &capabilities,
             },
             &request,
@@ -2405,5 +2918,68 @@ mod tests {
         assert_eq!(ack["id"], "tv-1");
         assert_eq!(ack["request_id"], "request-1");
         assert_eq!(ack["state"], "stopped");
+    }
+
+    #[test]
+    fn status_media_follows_the_current_playlist_index() {
+        let receiver = receiver_from_preferred(&preferred_device("playbridge")).unwrap();
+        let capabilities = CastCapabilities::default();
+        let snapshot = CastSnapshot {
+            state: "playing".into(),
+            title: "Episode 2".into(),
+            position_ms: 1000,
+            duration_ms: 2000,
+            current_index: Some(1),
+            total_count: Some(2),
+            volume: None,
+            muted: None,
+            looping: None,
+            speed: None,
+        };
+        let media_items = vec!["one.mp4".into(), "two.mp4".into()];
+        let status = status_json(
+            JsonStatusContext {
+                session_id: "session-1",
+                receiver: &receiver,
+                media_items: &media_items,
+                capabilities: &capabilities,
+            },
+            &snapshot,
+        );
+
+        assert_eq!(status["media"], "two.mp4");
+        assert_eq!(status["current_index"], 1);
+        assert_eq!(status["total_count"], 2);
+    }
+
+    #[test]
+    fn status_does_not_report_the_first_item_for_an_unknown_index() {
+        let receiver = receiver_from_preferred(&preferred_device("playbridge")).unwrap();
+        let capabilities = CastCapabilities::default();
+        let snapshot = CastSnapshot {
+            state: "playing".into(),
+            title: "Receiver-added item".into(),
+            position_ms: 0,
+            duration_ms: 0,
+            current_index: Some(2),
+            total_count: Some(3),
+            volume: None,
+            muted: None,
+            looping: None,
+            speed: None,
+        };
+        let media_items = vec!["one.mp4".into()];
+        let status = status_json(
+            JsonStatusContext {
+                session_id: "session-1",
+                receiver: &receiver,
+                media_items: &media_items,
+                capabilities: &capabilities,
+            },
+            &snapshot,
+        );
+
+        assert!(status["media"].is_null());
+        assert_eq!(status["current_index"], 2);
     }
 }

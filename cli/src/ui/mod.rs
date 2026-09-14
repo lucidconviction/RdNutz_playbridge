@@ -3178,6 +3178,8 @@ mod tests {
             title: "Movie".into(),
             position_ms: 5_000,
             duration_ms: 60_000,
+            current_index: None,
+            total_count: None,
             volume: Some(0.5),
             muted: None,
             looping: None,

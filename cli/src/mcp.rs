@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{collections::HashMap, process::Stdio, sync::Arc, time::Duration};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -10,22 +10,25 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
-    process::{Child, ChildStdout, Command},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
 
-use crate::json_session::{ControlRequest, JsonCastSession, new_request_id};
+use crate::{
+    credentials::PlaybridgeCredentials,
+    json_session::{ControlRequest, JsonCastSession, new_request_id},
+};
 
 const INSTRUCTIONS: &str = "\
 PlayBridge casts local files and stream URLs to TVs and receivers on the LAN.
 
 Workflow:
 1. Call discover to list receivers.
-2. Call send with a file path or http(s) URL. Pass the protocol-qualified receiver id from discover when needed. One physical TV may expose multiple protocol endpoints.
+2. Call send with target for a simple cast, or items for rich media/playlist metadata and request headers. Pass the protocol-qualified receiver id from discover when needed. One physical TV may expose multiple protocol endpoints.
 3. Keep the session_id returned by send for every later call.
 4. If send returns error pairing_required, ask the user for the six-digit code shown on the receiver, then call submit_pair_code with that session_id. It waits for the real pairing result.
-5. Use status to inspect playback and control to pause, play, seek, or stop.
+5. Use status and control for playback. PlayBridge sessions also support queue_add, playlist_jump, browser, browser_control, and remote.
 
 Use list_paired, forget, and pair to manage this CLI sender's local receiver credentials. These tools never revoke another sender from the receiver.
 
@@ -34,17 +37,19 @@ send.skip_history overrides whether a PlayBridge receiver saves a cast in histor
 Do not invent playbridge CLI flags. Use these tools. seek seconds are relative (e.g. 60 or -10).";
 
 pub fn usage() -> &'static str {
-    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, list_paired, forget, pair, submit_pair_code, status, control\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
+    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, list_paired, forget, pair, submit_pair_code, status, control, queue_add, playlist_jump, browser, browser_control, remote\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
 }
 
 #[derive(Clone)]
 pub struct PlaybridgeMcp {
     send_child: Arc<Mutex<Option<ManagedSend>>>,
+    command_lock: Arc<Mutex<()>>,
 }
 
 struct ManagedSend {
     child: Child,
     stdout: BufReader<ChildStdout>,
+    stdin: Option<ChildStdin>,
     session_id: String,
     waiting_for_pairing: bool,
 }
@@ -56,6 +61,10 @@ struct ToolOutput {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pair_code_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +85,30 @@ struct ToolOutput {
     position_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    muted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    looping: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<CapabilitiesOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,14 +173,211 @@ struct DiscoverParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SendParams {
-    /// Local file path or http(s) media URL to cast.
-    target: String,
+    /// Local file path or http(s) media URL. Shorthand for a one-item playlist.
+    #[serde(default)]
+    target: Option<String>,
+    /// Rich PlayBridge media items. Cannot be combined with target.
+    #[serde(default)]
+    items: Vec<MediaItemParams>,
+    /// Zero-based item to start with. Only valid with items.
+    #[serde(default, alias = "startIndex")]
+    start_index: Option<usize>,
+    /// Playlist-level metadata used by receiver pre-play UI.
+    #[serde(default, alias = "visualMetadata")]
+    visual_metadata: Option<VisualMetadataParams>,
+    /// Skip the receiver's metadata-rich pre-play screen.
+    #[serde(default, alias = "skipPreplay")]
+    skip_preplay: Option<bool>,
     /// Optional receiver id, uuid, name, or IP from discover.
     #[serde(default)]
     device: Option<String>,
     /// Override whether this cast is excluded from receiver history. Omit to use the CLI default.
+    #[serde(default, alias = "skipHistory")]
+    skip_history: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MediaItemParams {
+    /// Local file path or http(s) media URL.
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    /// HTTP request headers, including Referer, Cookie, Authorization, or User-Agent.
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    subtitles: Vec<String>,
+    #[serde(default)]
+    subtitle_resources: Vec<SubtitleResourceParams>,
+    /// video, audio, or image.
+    #[serde(default)]
+    media_kind: Option<String>,
+    #[serde(default)]
+    display_duration_ms: Option<u64>,
     #[serde(default)]
     skip_history: Option<bool>,
+    #[serde(default)]
+    detected_by: Option<String>,
+    #[serde(default)]
+    player_mode: Option<String>,
+    #[serde(default)]
+    preferred_audio_language: Option<String>,
+    #[serde(default)]
+    preferred_subtitle_language: Option<String>,
+    #[serde(default)]
+    default_video_quality: Option<String>,
+    #[serde(default)]
+    max_bitrate_cap_mbps: Option<f64>,
+    #[serde(default)]
+    visual_metadata: Option<VisualMetadataParams>,
+    #[serde(default)]
+    binge_group: Option<String>,
+    #[serde(default)]
+    start_position_ms: Option<u64>,
+    #[serde(default)]
+    allowed_private_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleResourceParams {
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct VisualMetadataParams {
+    title: String,
+    #[serde(default)]
+    year: Option<String>,
+    #[serde(default)]
+    rating: Option<String>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    cast: Vec<String>,
+    #[serde(default)]
+    director: Vec<String>,
+    #[serde(default)]
+    backdrop_url: Option<String>,
+    #[serde(default)]
+    poster_url: Option<String>,
+    #[serde(default)]
+    logo_url: Option<String>,
+    #[serde(default)]
+    season: Option<i32>,
+    #[serde(default)]
+    episode: Option<i32>,
+    #[serde(default)]
+    episode_title: Option<String>,
+    #[serde(default)]
+    imdb_id: Option<String>,
+    #[serde(default)]
+    tmdb_id: Option<String>,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    album_artist: Option<String>,
+    #[serde(default)]
+    artwork_url: Option<String>,
+    #[serde(default)]
+    track_number: Option<i32>,
+}
+
+impl SendParams {
+    fn rich_payload(&self) -> Result<Option<Value>, String> {
+        match (&self.target, self.items.is_empty()) {
+            (Some(_), false) => return Err("target cannot be combined with items".into()),
+            (None, true) => return Err("send requires target or at least one item".into()),
+            _ => {}
+        }
+        if self.items.len() > 256 {
+            return Err("items cannot contain more than 256 entries".into());
+        }
+        if let Some(index) = self.start_index
+            && (self.items.is_empty() || index >= self.items.len())
+        {
+            return Err("start_index must select an item".into());
+        }
+        for item in &self.items {
+            validate_media_item(item)?;
+        }
+        if self.items.is_empty() {
+            if self.start_index.is_some()
+                || self.visual_metadata.is_some()
+                || self.skip_preplay.is_some()
+            {
+                return Err("playlist options require items".into());
+            }
+            return Ok(None);
+        }
+        let mut payload = serde_json::json!({
+            "items": self.items,
+            "startIndex": self.start_index.unwrap_or(0),
+        });
+        if let Some(metadata) = &self.visual_metadata {
+            payload["visualMetadata"] = serde_json::to_value(metadata)
+                .map_err(|error| format!("could not encode visualMetadata: {error}"))?;
+        }
+        if let Some(skip_preplay) = self.skip_preplay {
+            payload["skipPreplay"] = serde_json::json!(skip_preplay);
+        }
+        Ok(Some(payload))
+    }
+
+    fn primary_target(&self) -> Option<&str> {
+        self.target
+            .as_deref()
+            .or_else(|| self.items.first().map(|item| item.url.as_str()))
+    }
+}
+
+fn validate_media_item(item: &MediaItemParams) -> Result<(), String> {
+    if item.url.trim().is_empty() {
+        return Err("media item url cannot be empty".into());
+    }
+    if item.headers.len() > 16 {
+        return Err("media item headers cannot contain more than 16 entries".into());
+    }
+    if item.subtitle_resources.len() > 16 || item.allowed_private_origins.len() > 16 {
+        return Err("subtitleResources and allowedPrivateOrigins are limited to 16 entries".into());
+    }
+    if item
+        .media_kind
+        .as_deref()
+        .is_some_and(|kind| !matches!(kind, "video" | "audio" | "image"))
+    {
+        return Err("mediaKind must be video, audio, or image".into());
+    }
+    if item
+        .max_bitrate_cap_mbps
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err("maxBitrateCapMbps must be greater than zero".into());
+    }
+    if item.visual_metadata.as_ref().is_some_and(|metadata| {
+        metadata.season.is_some_and(|value| value < 0)
+            || metadata.episode.is_some_and(|value| value < 0)
+            || metadata.track_number.is_some_and(|value| value < 0)
+    }) {
+        return Err("season, episode, and trackNumber cannot be negative".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -188,7 +418,7 @@ struct StatusParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ControlParams {
-    /// One of: pause, play, toggle, stop, seek, volume, mute, speed.
+    /// One of: pause, play, toggle, stop, seek, volume, mute, loop, speed, audio_boost.
     command: String,
     /// Session id returned by send. Defaults to this MCP server's managed send.
     #[serde(default)]
@@ -204,11 +434,51 @@ struct ControlParams {
     value: Option<f32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct QueueAddParams {
+    item: MediaItemParams,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PlaylistJumpParams {
+    index: usize,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserParams {
+    url: String,
+    #[serde(default)]
+    browser_mode: Option<String>,
+    #[serde(default)]
+    desktop_mode: Option<bool>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserControlParams {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RemoteParams {
+    /// dpad_up, dpad_down, dpad_left, dpad_right, dpad_center, back, home, volume_up, volume_down, or mute.
+    key: String,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
 #[tool_router]
 impl PlaybridgeMcp {
     pub fn new() -> Self {
         Self {
             send_child: Arc::new(Mutex::new(None)),
+            command_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -240,7 +510,40 @@ impl PlaybridgeMcp {
         &self,
         Parameters(_params): Parameters<ListPairedParams>,
     ) -> Result<CallToolResult, McpError> {
-        json_result(run_json_command(&["paired".into(), "--json".into()]).await)
+        let mut paired = match PlaybridgeCredentials::list() {
+            Ok(paired) => paired,
+            Err(error) => return json_result(Err(error)),
+        };
+        if paired.iter().any(|item| item.name.is_none())
+            && let Ok(discovery) = run_json_command(&[
+                "discover".into(),
+                "--json".into(),
+                "--protocol".into(),
+                "playbridge".into(),
+                "--timeout".into(),
+                "3".into(),
+            ])
+            .await
+            && let Some(receivers) = discovery.get("receivers").and_then(Value::as_array)
+        {
+            for item in &mut paired {
+                let Some(receiver) = receivers.iter().find(|receiver| {
+                    receiver.get("uuid").and_then(Value::as_str) == Some(item.uuid.as_str())
+                        || receiver
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| {
+                                id.strip_prefix("playbridge:") == Some(item.uuid.as_str())
+                            })
+                }) else {
+                    continue;
+                };
+                if let Some(name) = receiver.get("name").and_then(Value::as_str) {
+                    item.name = Some(name.to_owned());
+                }
+            }
+        }
+        json_result(Ok(serde_json::json!({ "ok": true, "paired": paired })))
     }
 
     #[tool(
@@ -298,17 +601,32 @@ impl PlaybridgeMcp {
             args.push("--device".into());
             args.push(device);
         }
+        let _command_guard = self.command_lock.lock().await;
         self.start_managed(args, session_id).await
     }
 
     #[tool(
-        description = "Cast a local file or stream URL to a receiver. skip_history overrides the persisted CLI history default for PlayBridge receivers. Starts playback and keeps a session for status/control. If the result has error pairing_required, ask the user for the code on the receiver and call submit_pair_code. If error is preferred_unreachable, pick a receiver from the list and call send again with device.",
+        description = "Cast target as a simple local file/URL, or items as a rich PlayBridge playlist with headers, subtitles, playback preferences, and metadata. target and items are mutually exclusive. skip_history supplies the default for items that omit skipHistory. Starts playback and keeps a session for later tools.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
     )]
     async fn send(
         &self,
         Parameters(params): Parameters<SendParams>,
     ) -> Result<CallToolResult, McpError> {
+        let rich_payload = match params.rich_payload() {
+            Ok(payload) => payload,
+            Err(message) => {
+                return json_result(Ok(serde_json::json!({
+                    "ok": false,
+                    "error": "invalid_arguments",
+                    "message": message,
+                })));
+            }
+        };
+        let target = params
+            .primary_target()
+            .expect("validated send has a target")
+            .to_owned();
         let session_id = JsonCastSession::generate_id();
         let pair_path = JsonCastSession::pair_code_path(&session_id).map_err(internal)?;
         if let Some(parent) = pair_path.parent() {
@@ -318,13 +636,17 @@ impl PlaybridgeMcp {
 
         let mut args = vec![
             "send".to_owned(),
-            params.target,
+            target,
             "--json".to_owned(),
             "--pair-code-file".to_owned(),
             pair_path.to_string_lossy().into_owned(),
             "--session-id".to_owned(),
             session_id.clone(),
         ];
+        let mut payload_json = serde_json::to_vec(&rich_payload.unwrap_or(Value::Null))
+            .map_err(|error| internal(error.to_string()))?;
+        payload_json.push(b'\n');
+        args.push("--media-payload-stdin".into());
         if let Some(device) = params.device.filter(|value| !value.trim().is_empty()) {
             args.push("--device".into());
             args.push(device);
@@ -337,11 +659,28 @@ impl PlaybridgeMcp {
             });
         }
 
+        let _command_guard = self.command_lock.lock().await;
         let mut slot = self.send_child.lock().await;
         if let Some(previous) = slot.take() {
             stop_managed(previous).await;
         }
-        let mut child = spawn_playbridge(&args).map_err(internal)?;
+        let mut child = match spawn_playbridge(&args, true) {
+            Ok(child) => child,
+            Err(error) => {
+                JsonCastSession::cleanup(&session_id);
+                return Err(internal(error));
+            }
+        };
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::internal_error("send child has no stdin", None))?;
+        if let Err(error) = stdin.write_all(&payload_json).await {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            JsonCastSession::cleanup(&session_id);
+            return json_result(Err(error.to_string()));
+        }
         let stdout = child
             .stdout
             .take()
@@ -373,18 +712,20 @@ impl PlaybridgeMcp {
             *slot = Some(ManagedSend {
                 child,
                 stdout: reader,
+                stdin: Some(stdin),
                 session_id,
                 waiting_for_pairing: first.get("error").and_then(Value::as_str)
                     == Some("pairing_required"),
             });
         } else {
             let _ = child.wait().await;
+            JsonCastSession::cleanup(&session_id);
         }
         json_result(Ok(first))
     }
 
     #[tool(
-        description = "Submit the six-digit pairing code shown on the PlayBridge receiver. Waits for the receiver's actual approval and playback result. Call this only after send returned pairing_required. Ask the human for the code; do not guess it.",
+        description = "Submit the six-digit pairing code shown on the PlayBridge receiver. Waits for the receiver's actual approval and result. Call this after send or pair returned pairing_required. Ask the human for the code; do not guess it.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
     )]
     async fn submit_pair_code(
@@ -474,34 +815,180 @@ impl PlaybridgeMcp {
     }
 
     #[tool(
-        description = "Control a PlayBridge send session. command is pause, play, toggle, stop, seek, volume, mute, or speed. For seek pass seconds (e.g. 60). For volume pass delta. For speed pass value. stop ends the session.",
+        description = "Control a send session. command is pause, play, toggle, stop, seek, volume, mute, loop, speed, or audio_boost. For seek pass seconds, for volume pass delta, and for speed pass value. stop ends the session.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
     )]
     async fn control(
         &self,
         Parameters(params): Parameters<ControlParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _command_guard = self.command_lock.lock().await;
         let session_id = self.resolve_session_id(params.session_id).await;
-        let mut args = vec!["control".to_owned(), params.command, "--json".to_owned()];
-        append_session_id(&mut args, session_id.as_deref());
-        if let Some(seconds) = params.seconds {
-            args.push(seconds.to_string());
-        } else if let Some(delta) = params.delta {
-            args.push(delta.to_string());
-        } else if let Some(value) = params.value {
-            args.push(value.to_string());
+        let request = ControlRequest {
+            id: new_request_id(),
+            command: params.command,
+            seconds: params.seconds,
+            delta: params.delta,
+            value: params.value,
+            action: None,
+            payload: None,
+        };
+        json_result(self.submit_request(session_id, request).await)
+    }
+
+    #[tool(
+        description = "Append a rich media item to the active PlayBridge receiver queue.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn queue_add(
+        &self,
+        Parameters(mut params): Parameters<QueueAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(message) = validate_queue_item(&params.item) {
+            return invalid_arguments(message);
         }
-        let result = run_json_command(&args).await;
-        if let Ok(value) = &result
-            && value.get("command").and_then(Value::as_str) == Some("stop")
-            && value.get("ok").and_then(Value::as_bool) == Some(true)
+        if params.item.skip_history.is_none() {
+            params.item.skip_history = Some(crate::ui::skip_history_default().map_err(internal)?);
+        }
+        self.submit_receiver_command(
+            params.session_id,
+            "queue_add",
+            serde_json::json!({ "item": params.item }),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Jump to a zero-based item in the active PlayBridge playlist.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn playlist_jump(
+        &self,
+        Parameters(params): Parameters<PlaylistJumpParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.submit_receiver_command(
+            params.session_id,
+            "playlist_jump",
+            serde_json::json!({ "index": params.index }),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Open a URL in the active PlayBridge receiver browser.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn browser(
+        &self,
+        Parameters(params): Parameters<BrowserParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if !params.url.starts_with("http://") && !params.url.starts_with("https://") {
+            return invalid_arguments("browser url must use http or https".into());
+        }
+        self.submit_receiver_command(
+            params.session_id,
+            "browser",
+            serde_json::json!({
+                "url": params.url,
+                "browserMode": params.browser_mode,
+                "desktopMode": params.desktop_mode,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Refresh the active PlayBridge receiver browser.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn browser_control(
+        &self,
+        Parameters(params): Parameters<BrowserControlParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.submit_receiver_command(
+            params.session_id,
+            "browser_control",
+            serde_json::json!({ "action": "refresh" }),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Send a navigation or TV volume key to the active PlayBridge receiver.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
+    )]
+    async fn remote(
+        &self,
+        Parameters(params): Parameters<RemoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if !is_supported_remote_key(&params.key) {
+            return invalid_arguments("unsupported remote key".into());
+        }
+        self.submit_receiver_command(
+            params.session_id,
+            "remote",
+            serde_json::json!({ "key": params.key }),
+        )
+        .await
+    }
+
+    async fn submit_receiver_command(
+        &self,
+        requested_session_id: Option<String>,
+        action: &str,
+        payload: Value,
+    ) -> Result<CallToolResult, McpError> {
+        let _command_guard = self.command_lock.lock().await;
+        let session_id = self.resolve_session_id(requested_session_id).await;
+        let request = ControlRequest {
+            id: new_request_id(),
+            command: "receiver_command".into(),
+            seconds: None,
+            delta: None,
+            value: None,
+            action: Some(action.to_owned()),
+            payload: Some(payload),
+        };
+        json_result(self.submit_request(session_id, request).await)
+    }
+
+    async fn submit_request(
+        &self,
+        session_id: Option<String>,
+        request: ControlRequest,
+    ) -> Result<Value, String> {
+        let mut slot = self.send_child.lock().await;
+        if let Some(managed) = slot.as_mut()
+            && session_id
+                .as_deref()
+                .is_none_or(|id| id == managed.session_id)
+            && let Some(stdin) = managed.stdin.as_mut()
         {
-            let mut slot = self.send_child.lock().await;
-            if let Some(child) = slot.take() {
-                stop_managed(child).await;
+            let mut message = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+            if message.len() > 256 * 1024 {
+                return Err("MCP control command exceeds 256 KiB".into());
             }
+            message.push(b'\n');
+            let request_id = request.id.clone();
+            let result = async {
+                stdin
+                    .write_all(&message)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                read_matching_ack(&mut managed.stdout, &request_id).await
+            };
+            let error = match tokio::time::timeout(Duration::from_secs(5), result).await {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) => error,
+                Err(_) => "control_timeout".to_owned(),
+            };
+            let failed = slot.take().expect("managed send still exists");
+            drop(slot);
+            stop_managed(failed).await;
+            return Err(error);
         }
-        json_result(result)
+        drop(slot);
+        JsonCastSession::submit(session_id.as_deref(), request).await
     }
 
     async fn resolve_session_id(&self, requested: Option<String>) -> Option<String> {
@@ -529,7 +1016,7 @@ impl PlaybridgeMcp {
         if let Some(previous) = slot.take() {
             stop_managed(previous).await;
         }
-        let mut child = spawn_playbridge(&args).map_err(internal)?;
+        let mut child = spawn_playbridge(&args, false).map_err(internal)?;
         let stdout = child
             .stdout
             .take()
@@ -557,6 +1044,7 @@ impl PlaybridgeMcp {
             *slot = Some(ManagedSend {
                 child,
                 stdout: reader,
+                stdin: None,
                 session_id,
                 waiting_for_pairing: true,
             });
@@ -565,6 +1053,27 @@ impl PlaybridgeMcp {
         }
         json_result(Ok(first))
     }
+}
+
+fn is_supported_remote_key(key: &str) -> bool {
+    matches!(
+        key,
+        "dpad_up"
+            | "dpad_down"
+            | "dpad_left"
+            | "dpad_right"
+            | "dpad_center"
+            | "back"
+            | "home"
+            | "volume_up"
+            | "volume_down"
+            | "mute"
+    )
+}
+
+fn validate_queue_item(item: &MediaItemParams) -> Result<(), String> {
+    validate_media_item(item)?;
+    crate::send::validate_media_target(&item.url)
 }
 
 #[tool_handler]
@@ -596,10 +1105,14 @@ fn playbridge_exe() -> Result<std::path::PathBuf, String> {
     std::env::current_exe().map_err(|error| error.to_string())
 }
 
-fn spawn_playbridge(args: &[String]) -> Result<Child, String> {
+fn spawn_playbridge(args: &[String], pipe_stdin: bool) -> Result<Child, String> {
     Command::new(playbridge_exe()?)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -614,6 +1127,8 @@ async fn stop_managed(mut managed: ManagedSend) {
         seconds: None,
         delta: None,
         value: None,
+        action: None,
+        payload: None,
     };
     let _ = JsonCastSession::submit(Some(&managed.session_id), stop).await;
     if tokio::time::timeout(Duration::from_secs(2), managed.child.wait())
@@ -648,10 +1163,11 @@ async fn run_json_command(args: &[String]) -> Result<Value, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).map_err(|error| {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let command = args.first().map_or("command", String::as_str);
         if stdout.trim().is_empty() && stderr.trim().is_empty() {
-            format!("playbridge {} produced no JSON ({error})", args.join(" "))
+            format!("playbridge {command} produced no JSON ({error})")
         } else {
-            format!("invalid JSON from playbridge {}: {error}", args.join(" "))
+            format!("invalid JSON from playbridge {command}: {error}")
         }
     })
 }
@@ -672,6 +1188,18 @@ async fn read_json_value<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Valu
         }
         buf.push_str(&line);
         if let Ok(value) = serde_json::from_str::<Value>(buf.trim()) {
+            return Ok(value);
+        }
+    }
+}
+
+async fn read_matching_ack<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    request_id: &str,
+) -> Result<Value, String> {
+    loop {
+        let value = read_json_value(reader).await?;
+        if value.get("request_id").and_then(Value::as_str) == Some(request_id) {
             return Ok(value);
         }
     }
@@ -701,6 +1229,14 @@ fn json_result(result: Result<Value, String>) -> Result<CallToolResult, McpError
     }
 }
 
+fn invalid_arguments(message: String) -> Result<CallToolResult, McpError> {
+    json_result(Ok(serde_json::json!({
+        "ok": false,
+        "error": "invalid_arguments",
+        "message": message,
+    })))
+}
+
 fn internal(error: String) -> McpError {
     McpError::internal_error(error, None)
 }
@@ -708,7 +1244,8 @@ fn internal(error: String) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PairCodeParams, PlaybridgeMcp, json_result, normalized_pair_code, read_json_value,
+        MediaItemParams, PairCodeParams, PlaybridgeMcp, SendParams, is_supported_remote_key,
+        json_result, normalized_pair_code, read_json_value, read_matching_ack, validate_queue_item,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use tokio::io::BufReader;
@@ -729,6 +1266,11 @@ mod tests {
             "submit_pair_code",
             "status",
             "control",
+            "queue_add",
+            "playlist_jump",
+            "browser",
+            "browser_control",
+            "remote",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),
@@ -736,10 +1278,69 @@ mod tests {
             );
         }
         assert!(
+            !names.iter().any(|name| name == "mouse"),
+            "mouse must not be exposed to MCP agents"
+        );
+        assert!(
             PlaybridgeMcp::tool_router()
                 .list_all()
                 .iter()
                 .all(|tool| tool.output_schema.is_some())
+        );
+    }
+
+    #[test]
+    fn rich_send_preserves_android_media_fields_and_sensitive_headers() {
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "url": "https://cdn.example.test/video.m3u8",
+                "title": "Episode 1",
+                "headers": {
+                    "Referer": "https://example.test/",
+                    "Authorization": "Bearer secret"
+                },
+                "contentType": "application/vnd.apple.mpegurl",
+                "subtitleResources": [{
+                    "url": "https://cdn.example.test/sub.vtt",
+                    "headers": { "Cookie": "subtitle-secret" },
+                    "language": "en"
+                }],
+                "mediaKind": "video",
+                "startPositionMs": 120000,
+                "preferredAudioLanguage": "en",
+                "visualMetadata": {
+                    "title": "Show",
+                    "season": 1,
+                    "episode": 1
+                }
+            }],
+            "start_index": 0,
+            "skip_preplay": true
+        }))
+        .unwrap();
+        let payload = params.rich_payload().unwrap().unwrap();
+        assert_eq!(
+            payload["items"][0]["headers"]["Referer"],
+            "https://example.test/"
+        );
+        assert_eq!(
+            payload["items"][0]["subtitleResources"][0]["headers"]["Cookie"],
+            "subtitle-secret"
+        );
+        assert_eq!(payload["items"][0]["startPositionMs"], 120000);
+        assert_eq!(payload["skipPreplay"], true);
+    }
+
+    #[test]
+    fn send_rejects_target_combined_with_items() {
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "target": "https://example.test/one.mp4",
+            "items": [{ "url": "https://example.test/two.mp4" }]
+        }))
+        .unwrap();
+        assert_eq!(
+            params.rich_payload().unwrap_err(),
+            "target cannot be combined with items"
         );
     }
 
@@ -768,6 +1369,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_schema_describes_pairing_event_fields() {
+        for tool in PlaybridgeMcp::tool_router().list_all() {
+            let schema = serde_json::to_value(tool.output_schema.as_ref().unwrap()).unwrap();
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(
+                properties.contains_key("event"),
+                "{} lacks event",
+                tool.name
+            );
+            assert!(
+                properties.contains_key("pair_code_file"),
+                "{} lacks pair_code_file",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn remote_keys_match_the_supported_protocol_set() {
+        for key in [
+            "dpad_up",
+            "dpad_down",
+            "dpad_left",
+            "dpad_right",
+            "dpad_center",
+            "back",
+            "home",
+            "volume_up",
+            "volume_down",
+            "mute",
+        ] {
+            assert!(is_supported_remote_key(key), "remote rejected {key}");
+        }
+        assert!(!is_supported_remote_key("power"));
+    }
+
+    #[test]
+    fn queue_items_use_the_same_media_target_validation_as_send() {
+        let item: MediaItemParams = serde_json::from_value(serde_json::json!({
+            "url": "/definitely/missing/video.mp4"
+        }))
+        .unwrap();
+        assert!(validate_queue_item(&item).is_err());
+
+        let item: MediaItemParams = serde_json::from_value(serde_json::json!({
+            "url": "https://example.test/video.mp4"
+        }))
+        .unwrap();
+        assert!(validate_queue_item(&item).is_ok());
+    }
+
     #[tokio::test]
     async fn reads_pretty_printed_json_object() {
         let pretty = "{\n  \"ok\": true,\n  \"device\": \"TV\"\n}\n";
@@ -775,6 +1428,19 @@ mod tests {
         let value = read_json_value(&mut reader).await.unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["device"], "TV");
+    }
+
+    #[tokio::test]
+    async fn matching_ack_skips_a_late_response_from_an_earlier_command() {
+        let input = br#"{"ok":true,"request_id":"old"}
+{"ok":true,"request_id":"current","command":"pause"}
+"#;
+        let mut reader = BufReader::new(&input[..]);
+
+        let value = read_matching_ack(&mut reader, "current").await.unwrap();
+
+        assert_eq!(value["request_id"], "current");
+        assert_eq!(value["command"], "pause");
     }
 
     #[tokio::test]

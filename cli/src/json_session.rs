@@ -30,6 +30,10 @@ pub struct ControlRequest {
     pub delta: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 
 pub struct JsonCastSession {
@@ -62,8 +66,7 @@ impl JsonCastSession {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             restrict_directory(parent)?;
         }
-        fs::write(&path, format!("{code}\n")).map_err(|error| error.to_string())?;
-        restrict_file(&path)?;
+        write_sensitive_atomic(&path, &format!("{code}\n"))?;
         Ok(path)
     }
 
@@ -159,7 +162,7 @@ impl JsonCastSession {
         if status_is_stale(&status) {
             return Err("no_active_session".into());
         }
-        write_atomic(
+        write_sensitive_atomic(
             &dir.join("control.json"),
             &serde_json::to_string_pretty(&request).map_err(|error| error.to_string())?,
         )?;
@@ -222,9 +225,22 @@ fn cleanup_paths(root: &std::path::Path, dir: &std::path::Path, session_id: &str
         "control.json",
         "ack.json",
         "pair-code",
+        "media-payload.json",
         "owner.lock",
     ] {
         let _ = fs::remove_file(dir.join(name));
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".tmp"))
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
     if fs::read_to_string(root.join("active-session"))
         .ok()
@@ -310,6 +326,38 @@ fn write_atomic(path: &PathBuf, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn write_sensitive_atomic(path: &PathBuf, contents: &str) -> Result<(), String> {
+    let temporary = path.with_extension(format!("{}.tmp", new_request_id()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(contents.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        if let Err(first_error) = fs::rename(&temporary, path) {
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| error.to_string())?;
+                fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+            } else {
+                return Err(first_error.to_string());
+            }
+        }
+        restrict_file(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub fn parse_control_args(
     arguments: &[String],
 ) -> Result<(Option<String>, ControlRequest), String> {
@@ -349,12 +397,14 @@ pub fn parse_control_args(
     }
     let command = command.ok_or_else(|| "missing control command".to_owned())?;
     let request = match command.as_str() {
-        "pause" | "play" | "toggle" | "stop" | "mute" => ControlRequest {
+        "pause" | "play" | "toggle" | "stop" | "mute" | "loop" | "audio_boost" => ControlRequest {
             id: new_request_id(),
             command,
             seconds: None,
             delta: None,
             value: None,
+            action: None,
+            payload: None,
         },
         "seek" => {
             let seconds = value
@@ -369,6 +419,8 @@ pub fn parse_control_args(
                 seconds: Some(seconds),
                 delta: None,
                 value: None,
+                action: None,
+                payload: None,
             }
         }
         "volume" => {
@@ -385,6 +437,8 @@ pub fn parse_control_args(
                 seconds: None,
                 delta: Some(delta),
                 value: None,
+                action: None,
+                payload: None,
             }
         }
         "speed" => {
@@ -401,6 +455,8 @@ pub fn parse_control_args(
                 seconds: None,
                 delta: None,
                 value: Some(speed),
+                action: None,
+                payload: None,
             }
         }
         other => return Err(format!("unknown control command: {other}")),
@@ -453,6 +509,13 @@ mod tests {
         assert_eq!(seek.seconds, Some(-10));
         let (_, volume) = parse_control_args(&["volume".into(), "0.1".into()]).unwrap();
         assert_eq!(volume.delta, Some(0.1));
+        assert_eq!(
+            parse_control_args(&["audio_boost".into()])
+                .unwrap()
+                .1
+                .command,
+            "audio_boost"
+        );
         assert!(parse_control_args(&["volume".into(), "2".into()]).is_err());
         assert!(parse_control_args(&["speed".into(), "NaN".into()]).is_err());
         assert!(parse_control_args(&[]).is_err());
@@ -523,6 +586,39 @@ mod tests {
             serde_json::from_str::<Value>(&fs::read_to_string(second.status_path()).unwrap())
                 .unwrap()["device"],
             "two"
+        );
+    }
+
+    #[test]
+    fn sensitive_payload_files_are_private_at_creation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("media-payload.json");
+        write_sensitive_atomic(&path, r#"{"headers":{"Authorization":"secret"}}"#).unwrap();
+        write_sensitive_atomic(&path, r#"{"headers":{"Cookie":"new-secret"}}"#).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("secret"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_atomic_write_removes_temporary_file_after_failure() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("control.json");
+        fs::create_dir(&path).unwrap();
+
+        assert!(write_sensitive_atomic(&path, r#"{"pairCode":"secret"}"#).is_err());
+        assert!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
     }
 }
