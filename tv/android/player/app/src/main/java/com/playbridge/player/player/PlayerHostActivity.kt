@@ -282,6 +282,9 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
                     val index = intent.getIntExtra(ServerService.EXTRA_PLAYLIST_JUMP_INDEX, -1)
                     if (index >= 0) lifecycleScope.launch { playbackCoordinator.jumpTo(index) }
                 }
+                ServerService.ACTION_QUEUE_MUTATE -> lifecycleScope.launch {
+                    ServerService.drainPendingQueueCommands().forEach { applyQueueCommand(it) }
+                }
                 ServerService.ACTION_RESYNC -> broadcastCurrentState()
             }
         }
@@ -381,6 +384,7 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
             addAction(ServerService.ACTION_MOUSE)
             addAction(ServerService.ACTION_QUEUE_ADD)
             addAction(ServerService.ACTION_PLAYLIST_JUMP)
+            addAction(ServerService.ACTION_QUEUE_MUTATE)
             addAction(ServerService.ACTION_RESYNC)
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
@@ -393,6 +397,9 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
         // while the Activity is starting. If the broadcast preceded registration, the pending
         // store is drained here; if it followed registration, the receiver drains it first.
         playbackCoordinator.queueAdd(ServerService.drainPendingQueueItems(this))
+        lifecycleScope.launch {
+            ServerService.drainPendingQueueCommands().forEach { applyQueueCommand(it) }
+        }
         refreshKeepScreenOn()
     }
 
@@ -1903,7 +1910,7 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
         lifecycleScope.launch { playbackCoordinator.next() }
     }
 
-    private fun broadcastPlaylistStatus(items: List<PlayPayload>, index: Int) {
+    private fun playlistStatusJson(items: List<PlayPayload>, index: Int): String {
         controlsViewModel.updatePlaylistData(items, index)
         controlsViewModel.setPlaylistVisible(items.size > 1)
         val itemsJson = org.json.JSONArray().apply {
@@ -1911,21 +1918,88 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
                 put(org.json.JSONObject().apply {
                     put("index", itemIndex)
                     put("title", item.title ?: "Item ${itemIndex + 1}")
+                    playbackCoordinator.itemIdAt(itemIndex)?.let { put("itemId", it) }
                     item.visual_metadata?.season?.let { put("season", it) }
                     item.visual_metadata?.episode?.let { put("episode", it) }
                     item.visual_metadata?.imdb_id?.let { put("imdbId", it) }
+                    item.visual_metadata?.tmdb_id?.let { put("tmdbId", it) }
                     item.binge_group?.let { put("bingeGroup", it) }
                     put("mediaKind", resolveMediaKind(item).wireValue)
                 })
             }
         }
-        val status = org.json.JSONObject().apply {
+        return org.json.JSONObject().apply {
             put("type", "playlist_status")
             put("items", itemsJson)
             put("currentIndex", if (items.isEmpty()) 0 else index)
             put("totalCount", items.size)
+            playbackCoordinator.playbackId?.let { put("playbackId", it) }
+            put("queueRevision", playbackCoordinator.queueRevision)
+            playbackCoordinator.itemIdAt(index)?.let { put("currentItemId", it) }
         }.toString()
-        ServerService.broadcastPlaylistStatus(this, status)
+    }
+
+    private fun broadcastPlaylistStatus(items: List<PlayPayload>, index: Int) {
+        ServerService.broadcastPlaylistStatus(this, playlistStatusJson(items, index))
+    }
+
+    private suspend fun applyQueueCommand(command: ServerService.Companion.PendingQueueCommand) {
+        val result = when (val message = command.message) {
+            is com.playbridge.shared.protocol.IncomingMessage.QueueAdd -> {
+                val items = buildList {
+                    message.payload.item?.let(::add)
+                    addAll(message.payload.items)
+                }
+                playbackCoordinator.queueAdd(items, message.payload.if_playback_id)
+            }
+            is com.playbridge.shared.protocol.IncomingMessage.PlaylistJump -> {
+                message.payload.item_id?.let {
+                    playbackCoordinator.jumpToItem(it, message.payload.if_playback_id)
+                } ?: run {
+                    if (message.payload.index !in playbackCoordinator.playlist.indices) {
+                        PlaybackCoordinator.MutationResult.ItemNotFound
+                    } else {
+                        playbackCoordinator.jumpTo(message.payload.index)
+                        PlaybackCoordinator.MutationResult.Applied
+                    }
+                }
+            }
+            is com.playbridge.shared.protocol.IncomingMessage.QueueRemove ->
+                playbackCoordinator.remove(message.payload.item_ids.toSet(), message.payload.if_playback_id)
+            is com.playbridge.shared.protocol.IncomingMessage.QueueMove ->
+                playbackCoordinator.move(
+                    message.payload.item_id,
+                    message.payload.before_item_id,
+                    message.payload.if_playback_id,
+                )
+            is com.playbridge.shared.protocol.IncomingMessage.QueueClear ->
+                playbackCoordinator.clear(message.payload.if_playback_id).also {
+                    if (it == PlaybackCoordinator.MutationResult.Applied) handleControl("stop")
+                }
+            is com.playbridge.shared.protocol.IncomingMessage.QueueQuery -> {
+                ServerService.sendQueueSnapshot(
+                    command,
+                    playlistStatusJson(playbackCoordinator.playlist, playbackCoordinator.index),
+                )
+                PlaybackCoordinator.MutationResult.Applied
+            }
+            else -> PlaybackCoordinator.MutationResult.InvalidCommand
+        }
+        val error = when (result) {
+            PlaybackCoordinator.MutationResult.Applied -> null
+            PlaybackCoordinator.MutationResult.NoActivePlayback -> "no_active_playback"
+            PlaybackCoordinator.MutationResult.StalePlayback -> "stale_playback"
+            PlaybackCoordinator.MutationResult.ItemNotFound -> "item_not_found"
+            PlaybackCoordinator.MutationResult.QueueFull -> "queue_full"
+            PlaybackCoordinator.MutationResult.InvalidCommand -> "invalid_command"
+        }
+        ServerService.completeQueueCommand(
+            command = command,
+            ok = error == null,
+            error = error,
+            playbackId = playbackCoordinator.playbackId,
+            queueRevision = playbackCoordinator.queueRevision,
+        )
     }
 
     private fun broadcastPlaybackStatus() {
@@ -1938,6 +2012,8 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
                 duration = lastDurationMs,
                 title = item?.title,
                 mediaKind = currentMediaKind.wireValue,
+                playbackId = playbackCoordinator.playbackId,
+                currentItemId = playbackCoordinator.itemIdAt(playbackCoordinator.index),
             ),
         )
     }

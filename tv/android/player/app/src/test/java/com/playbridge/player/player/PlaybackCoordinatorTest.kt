@@ -350,4 +350,46 @@ class PlaybackCoordinatorTest {
         c.setPlaylist(listOf(payload(1)), 0)
         assertEquals("Ep1", c.displayTitle(payload(1), 0))
     }
+
+    @Test
+    fun `replacement assigns stable identities and guarded append preserves playback`() {
+        val c = PlaybackCoordinator(FakeHost())
+        c.setPlaylist(listOf(payload(1)), 0, replacementId = "playback-a")
+        val firstItemId = c.itemIdAt(0)
+
+        assertEquals(
+            PlaybackCoordinator.MutationResult.Applied,
+            c.queueAdd(listOf(payload(2)), ifPlaybackId = "playback-a"),
+        )
+        assertEquals("playback-a", c.playbackId)
+        assertEquals(firstItemId, c.itemIdAt(0))
+        assertEquals(2, c.queueRevision)
+    }
+
+    @Test
+    fun `stale playback guard rejects mutation without changing queue`() {
+        val c = PlaybackCoordinator(FakeHost())
+        c.setPlaylist(listOf(payload(1)), 0, replacementId = "new-playback")
+
+        assertEquals(
+            PlaybackCoordinator.MutationResult.StalePlayback,
+            c.queueAdd(listOf(payload(2)), ifPlaybackId = "old-playback"),
+        )
+        assertEquals(1, c.playlist.size)
+        assertEquals(1, c.queueRevision)
+    }
+
+    @Test
+    fun `remove and move address stable item ids`() = runTest {
+        val c = PlaybackCoordinator(FakeHost())
+        c.setPlaylist(three, 0, replacementId = "playback")
+        val first = c.itemIdAt(0)!!
+        val second = c.itemIdAt(1)!!
+        val third = c.itemIdAt(2)!!
+
+        assertEquals(PlaybackCoordinator.MutationResult.Applied, c.move(third, first))
+        assertEquals(listOf("Ep3", "Ep1", "Ep2"), c.playlist.map { it.title })
+        assertEquals(PlaybackCoordinator.MutationResult.Applied, c.remove(setOf(second)))
+        assertEquals(listOf("Ep3", "Ep1"), c.playlist.map { it.title })
+    }
 }

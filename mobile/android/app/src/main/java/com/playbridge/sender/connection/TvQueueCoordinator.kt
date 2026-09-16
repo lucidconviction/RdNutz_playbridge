@@ -37,6 +37,7 @@ data class TvEpisodeQueuePlan(
 /** A combined tick of the signals the coordinator reacts to. */
 private data class QueueSignal(
     val playlistIndex: Int?,
+    val playbackId: String?,
     val title: String?,
     val activeContext: String,
     val window: Int
@@ -76,6 +77,7 @@ class TvQueueCoordinator(
     private var nextToResolve = 0
     /** Episode currently playing on the TV (forward-only); drives how far ahead we buffer. */
     private var currentEpisodeIndex = 0
+    private var managedPlaybackId: String? = null
     private var window = 1
     private var autoPick = AutoPickPrefs("Auto", null, "", emptySet())
     /** Bumped on every start()/stop()/re-attach so a slow re-attach can't clobber a newer session. */
@@ -98,7 +100,7 @@ class TvQueueCoordinator(
                 connectionCoordinator.tvPlayback,
                 connectionCoordinator.tvActiveContext,
                 settingsRepository.tvPrefetchWindow
-            ) { pl, pb, ctx, win -> QueueSignal(pl?.currentIndex, pb?.title, ctx, win) }
+            ) { pl, pb, ctx, win -> QueueSignal(pl?.currentIndex, pl?.playbackId, pb?.title, ctx, win) }
                 .collect { sig -> onSignal(sig) }
         }
     }
@@ -114,6 +116,7 @@ class TvQueueCoordinator(
                 queuedEpisodeIndices.add(newPlan.startIndex)
                 nextToResolve = newPlan.startIndex + 1
                 currentEpisodeIndex = newPlan.startIndex
+                managedPlaybackId = null
                 autoPick = AutoPickPrefs.fromContext(context)
             }
             Log.d(TAG, "Started: ${newPlan.items.size} episodes, start=${newPlan.startIndex}, bingeGroup=${newPlan.bingeGroup}")
@@ -147,6 +150,13 @@ class TvQueueCoordinator(
         // advanced while we were offline. Extending queuedEpisodeIndices / nextToResolve from
         // the echo prevents re-queue_add of the same S/E (duplicates).
         mutex.withLock {
+            if (managedPlaybackId == null) {
+                managedPlaybackId = sig.playbackId
+            } else if (sig.playbackId != null && sig.playbackId != managedPlaybackId) {
+                Log.i(TAG, "Stopping stale lazy queue after receiver playback replacement")
+                clearLocked()
+                return
+            }
             val fromTitle = sig.title?.takeIf { it.isNotBlank() }?.let { matchEpisodeByTitle(p, it) } ?: -1
             val fromPlaylist = sig.playlistIndex?.let { queuedEpisodeIndices.getOrNull(it) } ?: -1
             val derived = maxOf(fromTitle, fromPlaylist)
@@ -204,6 +214,7 @@ class TvQueueCoordinator(
         queuedEpisodeIndices.clear()
         nextToResolve = 0
         currentEpisodeIndex = 0
+        managedPlaybackId = null
     }
 
     /** One unit of top-up work, snapshotted under the lock. */
@@ -241,6 +252,8 @@ class TvQueueCoordinator(
                     // to resolve+fail-send in a loop, and a delivered-but-unacked queue_add would
                     // be retried after reconnect as a duplicate (TV-side dedup is the backstop).
                     if (!webSocketClient.isConnected()) return@withLock null
+                    val supportsGuard = "queue_crud_v1" in webSocketClient.tvCapabilitiesState.value.features
+                    if (supportsGuard && managedPlaybackId == null) return@withLock null
                     val ahead = queuedEpisodeIndices.count { it > currentEpisodeIndex }
                     if (ahead >= window || nextToResolve > p.items.lastIndex) return@withLock null
                     // Claim the index immediately so a superseding start()/re-attach that races
@@ -266,7 +279,13 @@ class TvQueueCoordinator(
                     // nextToResolve was already advanced by the claim (or reset by the superseder).
                     if (epoch != work.epoch || plan !== work.plan) return@withLock true
                     if (payload != null) {
-                        if (!webSocketClient.send(createQueueAddCommandJson(payload))) {
+                        val supportsGuard = "queue_crud_v1" in webSocketClient.tvCapabilitiesState.value.features
+                        val command = if (supportsGuard) {
+                            createQueueAddCommandJson(listOf(payload), managedPlaybackId)
+                        } else {
+                            createQueueAddCommandJson(payload)
+                        }
+                        if (!webSocketClient.send(command)) {
                             // Send failed (socket dropped) — re-claim so the next tick retries.
                             // Serial topUp means nothing past this claim is in-flight.
                             if (nextToResolve > work.index) nextToResolve = work.index

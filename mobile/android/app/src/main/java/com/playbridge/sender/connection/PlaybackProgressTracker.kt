@@ -82,6 +82,7 @@ class PlaybackProgressTracker(
     private val ensuredKeys = mutableSetOf<String>()
     private var lastPlaylistIndex: Int? = null
     private var sessionTmdbId: Int? = null
+    private var receiverPlaybackId: String? = null
 
     /** Last position/duration observed for the *current* playlist item — consulted on
      *  advance to distinguish "finished" from "user skipped ahead". */
@@ -176,17 +177,26 @@ class PlaybackProgressTracker(
         if (!enabled.value) return
         if (t.context == "idle") {
             resetSession()
+            receiverPlaybackId = null
             return
         }
-        val tmdbId = t.tmdbId ?: return // no identity (e.g. browser video) — track nothing
+        t.playlist?.playbackId?.let { playbackId ->
+            if (receiverPlaybackId != null && receiverPlaybackId != playbackId) resetSession()
+            receiverPlaybackId = playbackId
+        }
+        val items = t.playlist?.items.orEmpty()
+        val index = t.playlist?.currentItemId
+            ?.let { currentId -> items.indexOfFirst { it.itemId == currentId }.takeIf { it >= 0 } }
+            ?: t.playlist?.currentIndex
+            ?: 0
+        val tmdbId = items.getOrNull(index)?.tmdbId?.toIntOrNull()
+            ?: t.tmdbId
+            ?: return // no identity (e.g. browser video) — track nothing
         if (tmdbId <= 0) return
         if (tmdbId != sessionTmdbId) {
             resetSession()
             sessionTmdbId = tmdbId
         }
-
-        val items = t.playlist?.items.orEmpty()
-        val index = t.playlist?.currentIndex ?: 0
 
         // 1. Advance: the TV moved past an item. Mark it watched only if the last
         //    position we saw while it was current was near its end — auto-advance

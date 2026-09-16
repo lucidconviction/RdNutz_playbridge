@@ -30,6 +30,14 @@ use crate::{
     preferred::PreferredDevice,
 };
 
+type CommandConfirmation = (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+);
+
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct CastCapabilities {
     pub play_pause: bool,
@@ -674,13 +682,14 @@ async fn json_session_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut poll_count = 0_u64;
     let mut consecutive_poll_failures = 0_u8;
+    let mut stop_playback_on_exit = true;
     loop {
         tokio::select! {
             _ = wait_interrupt() => break,
             request = read_stdin_control_request(), if stdin_commands => {
                 match request? {
                     Some(request) => {
-                        if process_json_request(
+                        match process_json_request(
                             &mut control,
                             &mut snapshot,
                             &request,
@@ -691,7 +700,12 @@ async fn json_session_loop(
                             &capabilities,
                             true,
                         ).await {
-                            break;
+                            JsonRequestOutcome::Continue => {}
+                            JsonRequestOutcome::Stop => break,
+                            JsonRequestOutcome::Detach => {
+                                stop_playback_on_exit = false;
+                                break;
+                            }
                         }
                     }
                     None => stdin_commands = false,
@@ -715,7 +729,7 @@ async fn json_session_loop(
                 }
                 if let Some(request) = session.take_request(&last_control_id) {
                     last_control_id = request.id.clone();
-                    if process_json_request(
+                    match process_json_request(
                         &mut control,
                         &mut snapshot,
                         &request,
@@ -726,8 +740,15 @@ async fn json_session_loop(
                         &capabilities,
                         false,
                     ).await {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        break;
+                        JsonRequestOutcome::Continue => {}
+                        JsonRequestOutcome::Stop => {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            break;
+                        }
+                        JsonRequestOutcome::Detach => {
+                            stop_playback_on_exit = false;
+                            break;
+                        }
                     }
                 }
                 let _ = session.write_status(&status_json(
@@ -737,7 +758,9 @@ async fn json_session_loop(
             }
         }
     }
-    stop_target(control).await;
+    if stop_playback_on_exit {
+        stop_target(control).await;
+    }
     Ok(())
 }
 
@@ -771,7 +794,7 @@ async fn process_json_request(
     receiver: &Receiver,
     capabilities: &CastCapabilities,
     emit_response: bool,
-) -> bool {
+) -> JsonRequestOutcome {
     let result = apply_json_control(control, snapshot, request, proxy_server, media_items).await;
     if matches!(result, Ok(JsonControlResult::Stop)) {
         snapshot.state = "stopped".into();
@@ -791,7 +814,17 @@ async fn process_json_request(
     if emit_response {
         let _ = emit_json(&ack);
     }
-    matches!(result, Ok(JsonControlResult::Stop))
+    match result {
+        Ok(JsonControlResult::Stop) => JsonRequestOutcome::Stop,
+        Ok(JsonControlResult::Detach) => JsonRequestOutcome::Detach,
+        Ok(JsonControlResult::Applied) | Err(_) => JsonRequestOutcome::Continue,
+    }
+}
+
+enum JsonRequestOutcome {
+    Continue,
+    Stop,
+    Detach,
 }
 
 fn json_status_context<'a>(
@@ -855,6 +888,7 @@ fn control_ack(
 enum JsonControlResult {
     Applied,
     Stop,
+    Detach,
 }
 
 async fn apply_json_control(
@@ -866,6 +900,7 @@ async fn apply_json_control(
 ) -> Result<JsonControlResult, String> {
     match request.command.as_str() {
         "stop" => Ok(JsonControlResult::Stop),
+        "detach" => Ok(JsonControlResult::Detach),
         "receiver_command" => {
             let action = request
                 .action
@@ -1250,6 +1285,183 @@ async fn resolve_json_playbridge_receiver(device: Option<&str>) -> Result<Receiv
         "receivers": discovered.iter().map(json_receiver).collect::<Vec<_>>(),
     }))?;
     Err(error.into())
+}
+
+async fn resolve_playbridge_receiver_quiet(device: &str) -> Result<Receiver, String> {
+    let discovered = discover_receivers()
+        .await
+        .into_iter()
+        .filter(|receiver| receiver.protocol == ReceiverProtocol::PlayBridge)
+        .collect::<Vec<_>>();
+    match select_receiver_by_selector(&discovered, device) {
+        Ok(Some(receiver)) => Ok(receiver),
+        Err(_) => Err("ambiguous_device".into()),
+        Ok(None) => Err("device_not_found".into()),
+    }
+}
+
+/// Apply a queue mutation directly to receiver-owned PlayBridge playback.
+/// The connection is deliberately short lived: closing it must not stop the
+/// receiver's current media or establish a CLI-owned cast session.
+pub(crate) async fn run_device_receiver_command(
+    device: &str,
+    action: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    let requires_v1 = matches!(action, "queue_remove" | "queue_move" | "queue_clear")
+        || (action == "queue_add"
+            && (payload.get("items").is_some() || payload.get("ifPlaybackId").is_some()))
+        || (action == "playlist_jump"
+            && (payload.get("itemId").is_some() || payload.get("ifPlaybackId").is_some()));
+    let receiver = resolve_playbridge_receiver_quiet(device).await?;
+    let address = receiver
+        .addresses
+        .iter()
+        .find(|address| address.contains('.'))
+        .cloned()
+        .or_else(|| receiver.addresses.first().cloned())
+        .ok_or_else(|| format!("{} has no reachable address", receiver.name))?;
+    let uuid = receiver_uuid(&receiver);
+    if PlaybridgeCredentials::load(&uuid).is_none() {
+        return Err(format!(
+            "{} has no stored pairing credentials; call pair first",
+            receiver.name
+        ));
+    }
+    let empty_payload = json!({ "items": [] });
+    let mut socket = cast_to_playbridge(
+        &address,
+        receiver.wss_port.or(receiver.port).unwrap_or(8765),
+        PlaybridgeLoad {
+            device_name: &receiver.name,
+            device_uuid: &uuid,
+            media_url: "",
+            media_title: "",
+            skip_history: false,
+            playlist_payload: Some(&empty_payload),
+            pair_only: true,
+        },
+    )
+    .await?;
+    let request_id = crate::json_session::new_request_id();
+    socket
+        .send_command(action, Some(payload), Some(&request_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    socket
+        .send(&SenderFrame::Command {
+            action: "context_query".into(),
+            payload: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut snapshot = None;
+    let mut command_result: Option<CommandConfirmation> = None;
+    let mut legacy_deadline: Option<tokio::time::Instant> = None;
+    let observed = loop {
+        let now = tokio::time::Instant::now();
+        let receive_deadline = legacy_deadline.map_or(deadline, |legacy| legacy.min(deadline));
+        if now >= receive_deadline {
+            break command_result;
+        }
+        match tokio::time::timeout(receive_deadline - now, socket.receive()).await {
+            Ok(Ok(Some(frame))) => match frame {
+                ReceiverFrame::PlaylistStatus {
+                    items,
+                    current_index,
+                    total_count,
+                    playback_id,
+                    queue_revision,
+                    current_item_id,
+                } => {
+                    snapshot = Some((
+                        items,
+                        current_index,
+                        total_count,
+                        playback_id,
+                        queue_revision,
+                        current_item_id,
+                    ));
+                    legacy_deadline
+                        .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(1));
+                    if let Some((ok, error, message, result_playback_id, result_revision)) =
+                        command_result.take()
+                        && (!ok
+                            || result_revision.is_none_or(|revision| revision == queue_revision))
+                    {
+                        break Some((ok, error, message, result_playback_id, result_revision));
+                    }
+                }
+                ReceiverFrame::CommandResult {
+                    request_id: result_request_id,
+                    ok,
+                    error,
+                    message,
+                    playback_id,
+                    queue_revision,
+                } if result_request_id == request_id => {
+                    if !ok
+                        || snapshot.as_ref().is_some_and(|value| {
+                            queue_revision.is_none_or(|revision| revision == value.4)
+                        })
+                    {
+                        break Some((ok, error, message, playback_id, queue_revision));
+                    }
+                    command_result = Some((ok, error, message, playback_id, queue_revision));
+                }
+                _ => {}
+            },
+            Ok(Ok(None)) => break command_result,
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => break command_result,
+        }
+    };
+    let _ = socket.close().await;
+
+    let confirmed = observed.is_some();
+    if !confirmed && requires_v1 {
+        return Err("receiver does not support confirmed queue CRUD v1".into());
+    }
+    let (ok, error, message, playback_id, queue_revision) =
+        observed.unwrap_or((true, None, None, None, None));
+    if !ok {
+        return Err(message
+            .or(error)
+            .unwrap_or_else(|| "receiver rejected command".into()));
+    }
+
+    let mut result = json!({
+        "ok": true,
+        "action": action,
+        "device": receiver.name,
+        "id": receiver.id.0,
+        "uuid": uuid,
+        "confirmed": confirmed,
+        "requestId": request_id,
+        "playbackId": playback_id,
+        "queueRevision": queue_revision,
+    });
+    if let Some((
+        items,
+        current_index,
+        total_count,
+        snapshot_playback_id,
+        snapshot_revision,
+        current_item_id,
+    )) = snapshot
+    {
+        result["playlist"] = json!({
+            "items": items,
+            "currentIndex": current_index,
+            "totalCount": total_count,
+            "playbackId": snapshot_playback_id,
+            "queueRevision": snapshot_revision,
+            "currentItemId": current_item_id,
+        });
+    }
+    Ok(result)
 }
 
 async fn select_discovered_receiver(
@@ -2082,6 +2294,7 @@ async fn dashboard_poll(
                         items,
                         current_index,
                         total_count,
+                        ..
                     } => {
                         snapshot.current_index = Some(current_index);
                         snapshot.total_count = Some(total_count);

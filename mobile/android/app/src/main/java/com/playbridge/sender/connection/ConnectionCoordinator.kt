@@ -87,6 +87,8 @@ class ConnectionCoordinator(
                                                 mediaKind = o.optString("mediaKind", "video")
                                                     .takeIf { it in setOf("video", "audio", "image") }
                                                     ?: "video",
+                                                itemId = o.optString("itemId", "").ifEmpty { null },
+                                                tmdbId = o.optString("tmdbId", "").ifEmpty { null },
                                             )
                                         )
                                     }
@@ -95,7 +97,10 @@ class ConnectionCoordinator(
                             tvPlaylistState.value = PlaylistUiState(
                                 currentIndex = json.optInt("currentIndex", 0),
                                 totalCount = json.optInt("totalCount", 0),
-                                items = episodes
+                                items = episodes,
+                                playbackId = json.optString("playbackId", "").ifEmpty { null },
+                                queueRevision = json.optLong("queueRevision", 0),
+                                currentItemId = json.optString("currentItemId", "").ifEmpty { null },
                             )
                             Log.d(
                                 TAG,

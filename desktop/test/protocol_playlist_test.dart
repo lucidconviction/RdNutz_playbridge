@@ -74,4 +74,76 @@ void main() {
 
     expect(command.skipPreplay, isFalse);
   });
+
+  test('parses guarded batch queue operations', () {
+    final add = parseCommand(jsonEncode({
+      'type': 'command',
+      'action': 'queue_add',
+      'payload': {
+        'items': [
+          {'url': 'https://media.example/one.mp4'},
+          {'url': 'https://media.example/two.mp4'},
+        ],
+        'ifPlaybackId': 'playback-1',
+      },
+    })) as QueueAddCmd;
+    expect(add.items, hasLength(2));
+    expect(add.ifPlaybackId, 'playback-1');
+
+    final move = parseCommand(jsonEncode({
+      'type': 'command',
+      'action': 'queue_move',
+      'payload': {
+        'itemId': 'item-2',
+        'beforeItemId': 'item-1',
+        'ifPlaybackId': 'playback-1',
+      },
+    })) as QueueMoveCmd;
+    expect(move.itemId, 'item-2');
+    expect(move.beforeItemId, 'item-1');
+    expect(move.ifPlaybackId, 'playback-1');
+  });
+
+  test('parses queue query, remove, clear, and stable-id jump', () {
+    expect(
+      parseCommand(jsonEncode({
+        'type': 'command',
+        'action': 'queue_query',
+        'payload': {},
+      })),
+      isA<QueueQueryCmd>(),
+    );
+    expect(
+      parseCommand(jsonEncode({
+        'type': 'command',
+        'action': 'queue_remove',
+        'payload': {
+          'itemIds': ['item-1']
+        },
+      })),
+      isA<QueueRemoveCmd>()
+          .having((value) => value.itemIds, 'itemIds', ['item-1']),
+    );
+    expect(
+      parseCommand(jsonEncode({
+        'type': 'command',
+        'action': 'queue_clear',
+        'payload': {'ifPlaybackId': 'playback-1'},
+      })),
+      isA<QueueClearCmd>().having(
+        (value) => value.ifPlaybackId,
+        'ifPlaybackId',
+        'playback-1',
+      ),
+    );
+    expect(
+      parseCommand(jsonEncode({
+        'type': 'command',
+        'action': 'playlist_jump',
+        'payload': {'itemId': 'item-3'},
+      })),
+      isA<PlaylistJumpCmd>()
+          .having((value) => value.itemId, 'itemId', 'item-3'),
+    );
+  });
 }

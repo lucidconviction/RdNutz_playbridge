@@ -125,7 +125,7 @@ struct RemoteControlScreen: View {
             VStack(alignment: .leading, spacing: 8) {
                 sectionTitle("Playlist (\(pl.currentIndex + 1)/\(pl.totalCount))")
                 ForEach(pl.items) { item in
-                    Button { vm.jump(toIndex: item.index) } label: {
+                    Button { vm.jump(to: item) } label: {
                         HStack {
                             Image(systemName: item.index == pl.currentIndex ? "play.circle.fill" : "circle")
                                 .foregroundColor(item.index == pl.currentIndex ? Theme.primary : Theme.onSurfaceVariant)

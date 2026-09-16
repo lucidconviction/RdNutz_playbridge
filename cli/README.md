@@ -124,7 +124,14 @@ entry in `headers`:
 ```
 
 Use `queue_add`, `playlist_jump`, `browser`, `browser_control`, and `remote`
-with the returned `session_id` for PlayBridge-only receiver features.
+with the returned `session_id` for PlayBridge-only receiver features. For
+receiver-owned playback started by another app or script, use device-centric
+`get_state`, `queue_add`, `queue_remove`, `queue_move`, `queue_clear`, and
+`playlist_jump`. Queue entries have stable `itemId` values, while `playbackId`
+can be passed as `if_playback_id` to prevent stale automation from changing a
+replacement cast. Device calls connect, authenticate, wait for the receiver's
+correlated command result, and detach without stopping playback. `queue_add`
+accepts up to 50 items per call. Do not pass both `device` and `session_id`.
 `list_paired` returns saved UUID/name metadata without credentials; for legacy
 records that predate saved names, it briefly discovers reachable PlayBridge
 receivers and fills names in that response by exact UUID without rewriting the

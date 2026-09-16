@@ -158,6 +158,63 @@ void main() {
     expect(engine.openCount, 2);
   });
 
+  test('shared queue keeps stable ids across add, move, remove, and jump',
+      () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1), item(2)], 0);
+    final playbackId = controller.playbackId;
+    final firstId = controller.queueItemIds[0];
+    final secondId = controller.queueItemIds[1];
+    final initialRevision = controller.queueRevision;
+
+    await controller.queueAddAll([item(3), item(4)]);
+    expect(controller.playbackId, playbackId);
+    expect(controller.queueItemIds.take(2), [firstId, secondId]);
+    expect(controller.queueRevision, initialRevision + 1);
+
+    expect(await controller.moveQueueItem(secondId, null), isTrue);
+    expect(controller.currentItemId, firstId);
+    expect(controller.queueItemIds.last, secondId);
+
+    expect(await controller.jumpToItem(secondId), isTrue);
+    expect(controller.currentItemId, secondId);
+    expect(await controller.removeQueueItems({secondId}), isTrue);
+    expect(controller.currentItemId, isNot(secondId));
+    expect(controller.queueItemIds, isNot(contains(secondId)));
+  });
+
+  test('batch removal and move-before preserve the active item identity',
+      () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1), item(2), item(3), item(4)], 1);
+    final activeId = controller.currentItemId!;
+    final firstId = controller.queueItemIds.first;
+    final lastId = controller.queueItemIds.last;
+
+    expect(await controller.moveQueueItem(lastId, firstId), isTrue);
+    expect(controller.queueItemIds.first, lastId);
+    expect(controller.currentItemId, activeId);
+
+    expect(await controller.removeQueueItems({firstId, lastId}), isTrue);
+    expect(controller.queueItemIds, isNot(contains(firstId)));
+    expect(controller.queueItemIds, isNot(contains(lastId)));
+    expect(controller.currentItemId, activeId);
+  });
+
+  test('new playlist replaces playback identity and stop clears it', () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1)], 0);
+    final firstPlaybackId = controller.playbackId;
+    await controller.playPlaylist([item(2)], 0);
+    expect(controller.playbackId, isNot(firstPlaybackId));
+    expect(controller.currentItemId, isNotNull);
+
+    await controller.stop();
+    expect(controller.playbackId, isNull);
+    expect(controller.currentItemId, isNull);
+    expect(controller.queueItemIds, isEmpty);
+  });
+
   test('HLS preselection preference defaults off and can be changed', () {
     final c = PlayerController(engineForTest: _FakeEngine());
 

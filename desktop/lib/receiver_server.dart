@@ -105,6 +105,11 @@ class ReceiverServer extends ChangeNotifier {
         ],
         players: const ['internal_mpv'],
         mediaKinds: const ['video', 'audio', 'image'],
+        features: const [
+          'queue_crud_v1',
+          'stable_item_ids',
+          'command_results',
+        ],
         screenMirrorWebRtc: true,
       ),
     );
@@ -190,7 +195,18 @@ class ReceiverServer extends ChangeNotifier {
         final raw = event['raw'];
         final connectionId = event['connection_id'];
         if (raw is String && connectionId is int) {
-          _handleCommand(parseCommand(raw), connectionId);
+          final requestId = event['request_id'] as String?;
+          _commandSerial = _commandSerial.then((_) async {
+            try {
+              await _handleCommand(parseCommand(raw), connectionId, requestId);
+            } catch (error) {
+              debugPrint('[server] command failed: $error');
+              _completeCommand(connectionId, requestId,
+                  ok: false, error: 'invalid_command');
+            }
+          }).catchError((Object error, StackTrace stackTrace) {
+            debugPrint('[server] command failed: $error');
+          });
         }
       case 'error':
         debugPrint('[server] Rust receiver: ${event['message']}');
@@ -246,10 +262,23 @@ class ReceiverServer extends ChangeNotifier {
     _runtime?.broadcast(const {'type': 'context', 'active': 'idle'});
   }
 
-  void _handleCommand(Command cmd, int connectionId) {
+  Future<void> _commandSerial = Future<void>.value();
+  final Map<String, Map<String, Object?>> _commandResults = {};
+
+  Future<void> _handleCommand(
+    Command cmd,
+    int connectionId,
+    String? requestId,
+  ) async {
+    final cacheKey = requestId;
+    final cached = cacheKey == null ? null : _commandResults[cacheKey];
+    if (cached != null) {
+      _runtime?.sendTo(connectionId, cached);
+      return;
+    }
     switch (cmd) {
       case ContextQueryCmd():
-        _runtime?.broadcast({
+        _runtime?.sendTo(connectionId, {
           'type': 'context',
           'active': screenMirror.isActive
               ? 'screen_mirror'
@@ -257,35 +286,140 @@ class ReceiverServer extends ChangeNotifier {
                   ? 'idle'
                   : 'player',
         });
-        _broadcastStatus();
-        _broadcastPlaylistStatus();
+        _sendStatus(connectionId);
+        _sendPlaylistStatus(connectionId);
         _broadcastTracksIfChanged(force: true);
       case PlaylistCmd(:final items, :final startIndex, :final skipPreplay):
         unawaited(
           screenMirror.stopForReplacement(reason: 'media_started'),
         );
         onNewMedia?.call();
-        unawaited(player.playPlaylist(
+        await player.playPlaylist(
           items
               .map((item) =>
                   receiverQueueItemFromPayload(item, skipPreplay: skipPreplay))
               .toList(),
           startIndex,
           isRemote: true,
-        ));
+        );
         _broadcastPlaylistStatus();
-      case PlaylistJumpCmd(:final index):
+      case PlaylistJumpCmd(:final index, :final itemId, :final ifPlaybackId):
+        if (requestId != null && player.playbackId == null) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'no_active_playback');
+          return;
+        }
+        if (!_playbackMatches(ifPlaybackId)) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'stale_playback');
+          return;
+        }
         onNewMedia?.call();
-        unawaited(player.jumpTo(index));
-        _broadcastPlaylistStatus();
-      case QueueAddCmd(:final item):
+        var found = false;
+        if (itemId != null) {
+          found = await player.jumpToItem(itemId, ifPlaybackId: ifPlaybackId);
+        } else if (index != null && index >= 0 && index < player.queue.length) {
+          found = await player.jumpToGuarded(index, ifPlaybackId: ifPlaybackId);
+        }
+        final jumpError = !found && !_playbackMatches(ifPlaybackId)
+            ? 'stale_playback'
+            : 'item_not_found';
+        _completeCommand(connectionId, requestId,
+            ok: found, error: found ? null : jumpError);
+        _sendPlaylistStatus(connectionId);
+      case QueueAddCmd(:final items, :final ifPlaybackId):
+        if (requestId != null && player.playbackId == null) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'no_active_playback');
+          return;
+        }
+        if (!_playbackMatches(ifPlaybackId)) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'stale_playback');
+          return;
+        }
+        if (items.length > 50) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'invalid_command');
+          return;
+        }
+        if (player.queue.length + items.length > 200) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'queue_full');
+          return;
+        }
         if (isPlaybackPromptActive?.call() ?? false) {
           onPromptContinue?.call();
         } else {
           onPlaybackActivity?.call();
         }
-        unawaited(player.queueAdd(receiverQueueItemFromPayload(item),
-            isRemote: true));
+        final added = await player.queueAddAll(
+          items.map(receiverQueueItemFromPayload).toList(growable: false),
+          isRemote: true,
+          ifPlaybackId: ifPlaybackId,
+        );
+        _completeCommand(connectionId, requestId,
+            ok: added, error: added ? null : 'stale_playback');
+        _sendPlaylistStatus(connectionId);
+      case QueueQueryCmd():
+        _sendPlaylistStatus(connectionId);
+        _completeCommand(connectionId, requestId, ok: true);
+      case QueueRemoveCmd(:final itemIds, :final ifPlaybackId):
+        if (player.playbackId == null) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'no_active_playback');
+          return;
+        }
+        if (!_playbackMatches(ifPlaybackId)) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'stale_playback');
+          return;
+        }
+        final removed = await player.removeQueueItems(itemIds.toSet(),
+            ifPlaybackId: ifPlaybackId);
+        final removeError = !removed && !_playbackMatches(ifPlaybackId)
+            ? 'stale_playback'
+            : 'item_not_found';
+        _completeCommand(connectionId, requestId,
+            ok: removed, error: removed ? null : removeError);
+        _sendPlaylistStatus(connectionId);
+      case QueueMoveCmd(
+          :final itemId,
+          :final beforeItemId,
+          :final ifPlaybackId
+        ):
+        if (player.playbackId == null) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'no_active_playback');
+          return;
+        }
+        if (!_playbackMatches(ifPlaybackId)) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'stale_playback');
+          return;
+        }
+        final moved = await player.moveQueueItem(itemId, beforeItemId,
+            ifPlaybackId: ifPlaybackId);
+        final moveError = !moved && !_playbackMatches(ifPlaybackId)
+            ? 'stale_playback'
+            : 'item_not_found';
+        _completeCommand(connectionId, requestId,
+            ok: moved, error: moved ? null : moveError);
+        _sendPlaylistStatus(connectionId);
+      case QueueClearCmd(:final ifPlaybackId):
+        if (player.playbackId == null) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'no_active_playback');
+          return;
+        }
+        if (!_playbackMatches(ifPlaybackId)) {
+          _completeCommand(connectionId, requestId,
+              ok: false, error: 'stale_playback');
+          return;
+        }
+        await player.stop();
+        _completeCommand(connectionId, requestId, ok: true);
+        _sendPlaylistStatus(connectionId);
       case ScreenMirrorStartCmd():
         onNewMedia?.call();
         unawaited(player.stop());
@@ -321,9 +455,37 @@ class ReceiverServer extends ChangeNotifier {
               player.rotateImage(dx);
           }
         }
+      case UnknownCmd():
+        _completeCommand(connectionId, requestId,
+            ok: false, error: 'invalid_command');
       default:
         break;
     }
+  }
+
+  bool _playbackMatches(String? expected) =>
+      expected == null || expected == player.playbackId;
+
+  void _completeCommand(
+    int connectionId,
+    String? requestId, {
+    required bool ok,
+    String? error,
+  }) {
+    if (requestId == null) return;
+    final result = <String, Object?>{
+      'type': 'command_result',
+      'requestId': requestId,
+      'ok': ok,
+      if (error != null) 'error': error,
+      if (player.playbackId != null) 'playbackId': player.playbackId,
+      'queueRevision': player.queueRevision,
+    };
+    _commandResults[requestId] = result;
+    if (_commandResults.length > 256) {
+      _commandResults.remove(_commandResults.keys.first);
+    }
+    _runtime?.sendTo(connectionId, result);
   }
 
   void _sendScreenMirrorMessage(
@@ -446,17 +608,24 @@ class ReceiverServer extends ChangeNotifier {
   }
 
   void _broadcastStatus() {
-    _runtime?.broadcast({
-      'type': 'status',
-      'state': player.state,
-      'position': player.positionMs,
-      'duration': player.durationMs,
-      if (player.currentTitle != null) 'title': player.currentTitle,
-      if (player.currentMediaKind != null)
-        'mediaKind': player.currentMediaKind!.wireValue,
-    });
+    _runtime?.broadcast(_statusMessage());
     _broadcastTracksIfChanged();
   }
+
+  Map<String, Object?> _statusMessage() => {
+        'type': 'status',
+        'state': player.state,
+        'position': player.positionMs,
+        'duration': player.durationMs,
+        if (player.currentTitle != null) 'title': player.currentTitle,
+        if (player.currentMediaKind != null)
+          'mediaKind': player.currentMediaKind!.wireValue,
+        if (player.playbackId != null) 'playbackId': player.playbackId,
+        if (player.currentItemId != null) 'currentItemId': player.currentItemId,
+      };
+
+  void _sendStatus(int connectionId) =>
+      _runtime?.sendTo(connectionId, _statusMessage());
 
   String? _lastTracksJson;
 
@@ -490,30 +659,41 @@ class ReceiverServer extends ChangeNotifier {
   }
 
   void _broadcastPlaylistStatus() {
-    _runtime?.broadcast({
-      'type': 'playlist_status',
-      'items': [
-        for (var index = 0; index < player.queue.length; index++)
-          {
-            'index': index,
-            'title': player.queue[index].title,
-            'mediaKind': player.queue[index].mediaKind.wireValue,
-            if (player.queue[index].season != null)
-              'season': player.queue[index].season,
-            if (player.queue[index].episode != null)
-              'episode': player.queue[index].episode,
-            if (player.queue[index].imdbId != null)
-              'imdbId': player.queue[index].imdbId,
-            if (player.queue[index].bingeGroup != null)
-              'bingeGroup': player.queue[index].bingeGroup,
-          },
-      ],
-      'currentIndex': player.queue.isEmpty
-          ? 0
-          : player.currentIndex.clamp(0, player.queue.length - 1).toInt(),
-      'totalCount': player.queue.length,
-    });
+    _runtime?.broadcast(_playlistStatusMessage());
   }
+
+  void _sendPlaylistStatus(int connectionId) =>
+      _runtime?.sendTo(connectionId, _playlistStatusMessage());
+
+  Map<String, Object?> _playlistStatusMessage() => {
+        'type': 'playlist_status',
+        'items': [
+          for (var index = 0; index < player.queue.length; index++)
+            {
+              'index': index,
+              'itemId': player.queueItemIds[index],
+              'title': player.queue[index].title,
+              'mediaKind': player.queue[index].mediaKind.wireValue,
+              if (player.queue[index].season != null)
+                'season': player.queue[index].season,
+              if (player.queue[index].episode != null)
+                'episode': player.queue[index].episode,
+              if (player.queue[index].imdbId != null)
+                'imdbId': player.queue[index].imdbId,
+              if (player.queue[index].tmdbId != null)
+                'tmdbId': player.queue[index].tmdbId,
+              if (player.queue[index].bingeGroup != null)
+                'bingeGroup': player.queue[index].bingeGroup,
+            },
+        ],
+        'currentIndex': player.queue.isEmpty
+            ? 0
+            : player.currentIndex.clamp(0, player.queue.length - 1).toInt(),
+        'totalCount': player.queue.length,
+        if (player.playbackId != null) 'playbackId': player.playbackId,
+        if (player.currentItemId != null) 'currentItemId': player.currentItemId,
+        'queueRevision': player.queueRevision,
+      };
 }
 
 /// Convert wire media without losing per-cast history policy.
@@ -553,6 +733,7 @@ QueueItem receiverQueueItemFromPayload(PlayPayload payload,
     season: payload.seasonOrNull,
     episode: payload.episodeOrNull,
     imdbId: payload.imdbIdOrNull,
+    tmdbId: payload.tmdbIdOrNull,
     backdropUrl: payload.backdropUrlOrNull,
     posterUrl: payload.posterUrlOrNull,
     logoUrl: payload.logoUrlOrNull,

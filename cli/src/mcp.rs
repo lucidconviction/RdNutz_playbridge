@@ -26,7 +26,7 @@ PlayBridge casts local files and stream URLs to TVs and receivers on the LAN.
 Workflow:
 1. Call discover to list receivers.
 2. Call send with target for a simple cast, or items for rich media/playlist metadata and request headers. Pass the protocol-qualified receiver id from discover when needed. One physical TV may expose multiple protocol endpoints.
-3. Keep the session_id returned by send for every later call.
+3. Keep the session_id returned by send for sender-owned resources. For receiver-owned PlayBridge state use device with get_state, queue_add, queue_remove, queue_move, queue_clear, or playlist_jump.
 4. If send returns error pairing_required, ask the user for the six-digit code shown on the receiver, then call submit_pair_code with that session_id. It waits for the real pairing result.
 5. Use status and control for playback. PlayBridge sessions also support queue_add, playlist_jump, browser, browser_control, and remote.
 
@@ -37,7 +37,7 @@ send.skip_history overrides whether a PlayBridge receiver saves a cast in histor
 Do not invent playbridge CLI flags. Use these tools. seek seconds are relative (e.g. 60 or -10).";
 
 pub fn usage() -> &'static str {
-    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, list_paired, forget, pair, submit_pair_code, status, control, queue_add, playlist_jump, browser, browser_control, remote\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
+    "PlayBridge MCP Server\n\nUsage:\n  playbridge mcp\n\nRuns a Model Context Protocol server over stdio. Available tools:\n  discover, send, list_paired, forget, pair, submit_pair_code, status, control, get_state, queue_add, queue_remove, queue_move, queue_clear, playlist_jump, browser, browser_control, remote\n\nThe server writes MCP messages to stdout; do not use it as an interactive command."
 }
 
 #[derive(Clone)]
@@ -52,6 +52,7 @@ struct ManagedSend {
     stdin: Option<ChildStdin>,
     session_id: String,
     waiting_for_pairing: bool,
+    receiver_owned_playback: bool,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -436,16 +437,64 @@ struct ControlParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct QueueAddParams {
-    item: MediaItemParams,
+    #[serde(default)]
+    item: Option<MediaItemParams>,
+    #[serde(default)]
+    items: Vec<MediaItemParams>,
+    #[serde(default)]
+    if_playback_id: Option<String>,
+    /// PlayBridge receiver id, UUID, or unambiguous name. Connects briefly and
+    /// appends to the receiver-owned queue without taking playback ownership.
+    #[serde(default)]
+    device: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PlaylistJumpParams {
-    index: usize,
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    if_playback_id: Option<String>,
+    /// PlayBridge receiver id, UUID, or unambiguous name. Connects briefly and
+    /// changes the receiver-owned queue without taking playback ownership.
+    #[serde(default)]
+    device: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DeviceParams {
+    device: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct QueueRemoveParams {
+    device: String,
+    item_ids: Vec<String>,
+    #[serde(default)]
+    if_playback_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct QueueMoveParams {
+    device: String,
+    item_id: String,
+    #[serde(default)]
+    before_item_id: Option<String>,
+    #[serde(default)]
+    if_playback_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct QueueClearParams {
+    device: String,
+    #[serde(default)]
+    if_playback_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -716,6 +765,8 @@ impl PlaybridgeMcp {
                 session_id,
                 waiting_for_pairing: first.get("error").and_then(Value::as_str)
                     == Some("pairing_required"),
+                receiver_owned_playback: first.get("protocol").and_then(Value::as_str)
+                    == Some("playbridge"),
             });
         } else {
             let _ = child.wait().await;
@@ -792,6 +843,8 @@ impl PlaybridgeMcp {
             }
         };
         managed.waiting_for_pairing = false;
+        managed.receiver_owned_playback =
+            value.get("protocol").and_then(Value::as_str) == Some("playbridge");
         if value.get("ok").and_then(Value::as_bool) != Some(true)
             && let Some(failed) = slot.take()
         {
@@ -837,41 +890,147 @@ impl PlaybridgeMcp {
     }
 
     #[tool(
-        description = "Append a rich media item to the active PlayBridge receiver queue.",
+        description = "Append a rich media item to a PlayBridge receiver queue. Pass device for a brief receiver-owned operation that does not require or stop an MCP send session; otherwise pass session_id or use this server's managed send.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
     )]
     async fn queue_add(
         &self,
         Parameters(mut params): Parameters<QueueAddParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(message) = validate_queue_item(&params.item) {
-            return invalid_arguments(message);
+        if let Some(item) = params.item.take() {
+            params.items.insert(0, item);
         }
-        if params.item.skip_history.is_none() {
-            params.item.skip_history = Some(crate::ui::skip_history_default().map_err(internal)?);
+        if params.items.is_empty() || params.items.len() > 50 {
+            return invalid_arguments("queue_add requires between 1 and 50 items".into());
         }
-        self.submit_receiver_command(
-            params.session_id,
-            "queue_add",
-            serde_json::json!({ "item": params.item }),
-        )
-        .await
+        for item in &params.items {
+            if let Err(message) = validate_queue_item(item) {
+                return invalid_arguments(message);
+            }
+        }
+        let skip_history = crate::ui::skip_history_default().map_err(internal)?;
+        for item in &mut params.items {
+            if item.skip_history.is_none() {
+                item.skip_history = Some(skip_history);
+            }
+        }
+        if params.device.is_some() && params.session_id.is_some() {
+            return invalid_arguments("device and session_id are mutually exclusive".into());
+        }
+        if let Some(device) = params.device.filter(|value| !value.trim().is_empty()) {
+            if params
+                .items
+                .iter()
+                .any(|item| std::path::Path::new(&item.url).is_file())
+            {
+                return invalid_arguments(
+                    "device queue_add requires a receiver-accessible URL; use a send session for local files"
+                        .into(),
+                );
+            }
+            let _command_guard = self.command_lock.lock().await;
+            let payload = queue_add_payload(params.items, params.if_playback_id);
+            return json_result(
+                crate::send::run_device_receiver_command(&device, "queue_add", payload).await,
+            );
+        }
+        let payload = queue_add_payload(params.items, params.if_playback_id);
+        self.submit_receiver_command(params.session_id, "queue_add", payload)
+            .await
     }
 
     #[tool(
-        description = "Jump to a zero-based item in the active PlayBridge playlist.",
+        description = "Jump to a zero-based item in a PlayBridge receiver playlist. Pass device for a brief receiver-owned operation that does not require or stop an MCP send session; otherwise pass session_id or use this server's managed send.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>()
     )]
     async fn playlist_jump(
         &self,
         Parameters(params): Parameters<PlaylistJumpParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.submit_receiver_command(
-            params.session_id,
-            "playlist_jump",
-            serde_json::json!({ "index": params.index }),
+        if params.index.is_some() == params.item_id.is_some() {
+            return invalid_arguments(
+                "playlist_jump requires exactly one of index or item_id".into(),
+            );
+        }
+        if params.device.is_some() && params.session_id.is_some() {
+            return invalid_arguments("device and session_id are mutually exclusive".into());
+        }
+        let payload = playlist_jump_payload(params.index, params.item_id, params.if_playback_id);
+        if let Some(device) = params.device.filter(|value| !value.trim().is_empty()) {
+            let _command_guard = self.command_lock.lock().await;
+            return json_result(
+                crate::send::run_device_receiver_command(&device, "playlist_jump", payload).await,
+            );
+        }
+        self.submit_receiver_command(params.session_id, "playlist_jump", payload)
+            .await
+    }
+
+    #[tool(description = "Read the authoritative queue and playback identity from a PlayBridge receiver.", output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>())]
+    async fn get_state(
+        &self,
+        Parameters(params): Parameters<DeviceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _command_guard = self.command_lock.lock().await;
+        json_result(
+            crate::send::run_device_receiver_command(
+                &params.device,
+                "queue_query",
+                serde_json::json!({}),
+            )
+            .await,
         )
-        .await
+    }
+
+    #[tool(description = "Remove stable item IDs from a receiver-owned PlayBridge queue.", output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>())]
+    async fn queue_remove(
+        &self,
+        Parameters(params): Parameters<QueueRemoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.item_ids.is_empty() {
+            return invalid_arguments("queue_remove requires item_ids".into());
+        }
+        let _command_guard = self.command_lock.lock().await;
+        let mut payload = serde_json::json!({"itemIds": params.item_ids});
+        if let Some(playback_id) = params.if_playback_id {
+            payload["ifPlaybackId"] = serde_json::json!(playback_id);
+        }
+        json_result(
+            crate::send::run_device_receiver_command(&params.device, "queue_remove", payload).await,
+        )
+    }
+
+    #[tool(description = "Move a stable queue item before another item, or to the end when before_item_id is omitted.", output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>())]
+    async fn queue_move(
+        &self,
+        Parameters(params): Parameters<QueueMoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _command_guard = self.command_lock.lock().await;
+        let mut payload = serde_json::json!({"itemId": params.item_id});
+        if let Some(before) = params.before_item_id {
+            payload["beforeItemId"] = serde_json::json!(before);
+        }
+        if let Some(playback_id) = params.if_playback_id {
+            payload["ifPlaybackId"] = serde_json::json!(playback_id);
+        }
+        json_result(
+            crate::send::run_device_receiver_command(&params.device, "queue_move", payload).await,
+        )
+    }
+
+    #[tool(description = "Explicitly clear receiver-owned PlayBridge playback. This is destructive and should only be called when requested.", output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput>())]
+    async fn queue_clear(
+        &self,
+        Parameters(params): Parameters<QueueClearParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _command_guard = self.command_lock.lock().await;
+        let mut payload = serde_json::json!({});
+        if let Some(playback_id) = params.if_playback_id {
+            payload["ifPlaybackId"] = serde_json::json!(playback_id);
+        }
+        json_result(
+            crate::send::run_device_receiver_command(&params.device, "queue_clear", payload).await,
+        )
     }
 
     #[tool(
@@ -1047,6 +1206,7 @@ impl PlaybridgeMcp {
                 stdin: None,
                 session_id,
                 waiting_for_pairing: true,
+                receiver_owned_playback: false,
             });
         } else {
             let _ = child.wait().await;
@@ -1069,6 +1229,36 @@ fn is_supported_remote_key(key: &str) -> bool {
             | "volume_down"
             | "mute"
     )
+}
+
+fn playlist_jump_payload(
+    index: Option<usize>,
+    item_id: Option<String>,
+    if_playback_id: Option<String>,
+) -> Value {
+    let mut payload = serde_json::json!({});
+    if let Some(index) = index {
+        payload["index"] = serde_json::json!(index);
+    }
+    if let Some(item_id) = item_id {
+        payload["itemId"] = serde_json::json!(item_id);
+    }
+    if let Some(playback_id) = if_playback_id {
+        payload["ifPlaybackId"] = serde_json::json!(playback_id);
+    }
+    payload
+}
+
+fn queue_add_payload(items: Vec<MediaItemParams>, if_playback_id: Option<String>) -> Value {
+    let mut payload = if items.len() == 1 && if_playback_id.is_none() {
+        serde_json::json!({ "item": items.into_iter().next().expect("one item") })
+    } else {
+        serde_json::json!({ "items": items })
+    };
+    if let Some(playback_id) = if_playback_id {
+        payload["ifPlaybackId"] = serde_json::json!(playback_id);
+    }
+    payload
 }
 
 fn validate_queue_item(item: &MediaItemParams) -> Result<(), String> {
@@ -1121,16 +1311,16 @@ fn spawn_playbridge(args: &[String], pipe_stdin: bool) -> Result<Child, String> 
 }
 
 async fn stop_managed(mut managed: ManagedSend) {
-    let stop = ControlRequest {
+    let request = ControlRequest {
         id: new_request_id(),
-        command: "stop".into(),
+        command: managed_teardown_command(managed.receiver_owned_playback).into(),
         seconds: None,
         delta: None,
         value: None,
         action: None,
         payload: None,
     };
-    let _ = JsonCastSession::submit(Some(&managed.session_id), stop).await;
+    let _ = JsonCastSession::submit(Some(&managed.session_id), request).await;
     if tokio::time::timeout(Duration::from_secs(2), managed.child.wait())
         .await
         .is_err()
@@ -1139,6 +1329,14 @@ async fn stop_managed(mut managed: ManagedSend) {
         let _ = managed.child.wait().await;
     }
     JsonCastSession::cleanup(&managed.session_id);
+}
+
+fn managed_teardown_command(receiver_owned_playback: bool) -> &'static str {
+    if receiver_owned_playback {
+        "detach"
+    } else {
+        "stop"
+    }
 }
 
 fn append_session_id(args: &mut Vec<String>, session_id: Option<&str>) {
@@ -1244,8 +1442,9 @@ fn internal(error: String) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaItemParams, PairCodeParams, PlaybridgeMcp, SendParams, is_supported_remote_key,
-        json_result, normalized_pair_code, read_json_value, read_matching_ack, validate_queue_item,
+        MediaItemParams, PairCodeParams, PlaybridgeMcp, QueueAddParams, SendParams,
+        is_supported_remote_key, json_result, managed_teardown_command, normalized_pair_code,
+        read_json_value, read_matching_ack, validate_queue_item,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use tokio::io::BufReader;
@@ -1266,7 +1465,11 @@ mod tests {
             "submit_pair_code",
             "status",
             "control",
+            "get_state",
             "queue_add",
+            "queue_remove",
+            "queue_move",
+            "queue_clear",
             "playlist_jump",
             "browser",
             "browser_control",
@@ -1287,6 +1490,23 @@ mod tests {
                 .iter()
                 .all(|tool| tool.output_schema.is_some())
         );
+    }
+
+    #[test]
+    fn queue_add_accepts_device_without_a_session() {
+        let params: QueueAddParams = serde_json::from_value(serde_json::json!({
+            "device": "playbridge:receiver-uuid",
+            "item": { "url": "https://example.test/video.mp4" }
+        }))
+        .unwrap();
+        assert_eq!(params.device.as_deref(), Some("playbridge:receiver-uuid"));
+        assert!(params.session_id.is_none());
+    }
+
+    #[test]
+    fn receiver_owned_playback_detaches_during_mcp_teardown() {
+        assert_eq!(managed_teardown_command(true), "detach");
+        assert_eq!(managed_teardown_command(false), "stop");
     }
 
     #[test]
