@@ -72,6 +72,8 @@ pub enum ReceiverFrame {
         media_kinds: Vec<String>,
         #[serde(default)]
         screen_mirror_web_rtc: bool,
+        #[serde(default)]
+        features: Vec<String>,
     },
     #[serde(rename = "status")]
     Status {
@@ -85,6 +87,10 @@ pub enum ReceiverFrame {
         title: Option<String>,
         #[serde(default)]
         media_kind: Option<String>,
+        #[serde(default)]
+        playback_id: Option<String>,
+        #[serde(default)]
+        current_item_id: Option<String>,
     },
     #[serde(rename = "playlist_status", rename_all = "camelCase")]
     PlaylistStatus {
@@ -94,6 +100,25 @@ pub enum ReceiverFrame {
         current_index: usize,
         #[serde(default)]
         total_count: usize,
+        #[serde(default)]
+        playback_id: Option<String>,
+        #[serde(default)]
+        queue_revision: u64,
+        #[serde(default)]
+        current_item_id: Option<String>,
+    },
+    #[serde(rename = "command_result", rename_all = "camelCase")]
+    CommandResult {
+        request_id: String,
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        playback_id: Option<String>,
+        #[serde(default)]
+        queue_revision: Option<u64>,
     },
     #[serde(other)]
     Unknown,
@@ -106,6 +131,20 @@ pub struct PlaylistStatusItem {
     pub index: usize,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub season: Option<u32>,
+    #[serde(default)]
+    pub episode: Option<u32>,
+    #[serde(default)]
+    pub imdb_id: Option<String>,
+    #[serde(default)]
+    pub tmdb_id: Option<String>,
+    #[serde(default)]
+    pub binge_group: Option<String>,
+    #[serde(default)]
+    pub media_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +161,8 @@ pub struct CredentialBundle {
     pub media_kinds: Vec<String>,
     #[serde(default)]
     pub screen_mirror_web_rtc: bool,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -507,6 +548,7 @@ mod tests {
                 current_index: 1,
                 total_count: 2,
                 items,
+                ..
             } if items[0].title == "Episode 2"
         ));
     }
@@ -615,6 +657,7 @@ mod tests {
             browsers: vec![],
             media_kinds: vec!["video".into(), "audio".into(), "image".into()],
             screen_mirror_web_rtc: true,
+            features: vec!["queue_crud_v1".into()],
         };
         let ReceiverFrame::PairingApproved { nonce, ciphertext } =
             receiver.approve(&mac, &credentials).unwrap()
