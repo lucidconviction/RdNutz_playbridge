@@ -71,7 +71,7 @@ class PlaybackCoordinator(private val host: Host) {
         stableItemIds.addAll(accepted.map(::stableItemId))
         cursor = startIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0))
         playbackId = replacementId
-        queueRevision = 1
+        queueRevision++
     }
 
     /**
@@ -158,6 +158,7 @@ class PlaybackCoordinator(private val host: Host) {
             return
         }
         cursor++
+        queueRevision++
         val item = items[cursor]
         host.loadItem(item, displayTitle(item, cursor))
         host.onPlaylistChanged(items, cursor)
@@ -175,6 +176,7 @@ class PlaybackCoordinator(private val host: Host) {
         }
         host.saveProgressBeforeAdvance(captureThumbnail = true)
         cursor--
+        queueRevision++
         val item = items[cursor]
         host.loadItem(item, displayTitle(item, cursor))
         host.onPlaylistChanged(items, cursor)
@@ -183,6 +185,7 @@ class PlaybackCoordinator(private val host: Host) {
     /** Jump to an explicit index (phone `playlist_jump` / on-TV panel selection). */
     suspend fun jumpTo(target: Int) {
         if (items.isEmpty() || target !in items.indices) return
+        if (target == cursor) return
         host.saveProgressBeforeAdvance(captureThumbnail = false)
         cursor = target
         queueRevision++
@@ -196,6 +199,14 @@ class PlaybackCoordinator(private val host: Host) {
         if (ifPlaybackId != null && ifPlaybackId != playbackId) return MutationResult.StalePlayback
         val target = stableItemIds.indexOf(itemId)
         if (target < 0) return MutationResult.ItemNotFound
+        jumpTo(target)
+        return MutationResult.Applied
+    }
+
+    suspend fun jumpToIndex(target: Int, ifPlaybackId: String? = null): MutationResult {
+        if (ifPlaybackId != null && !validId(ifPlaybackId)) return MutationResult.InvalidCommand
+        if (ifPlaybackId != null && ifPlaybackId != playbackId) return MutationResult.StalePlayback
+        if (target !in items.indices) return MutationResult.ItemNotFound
         jumpTo(target)
         return MutationResult.Applied
     }

@@ -271,7 +271,9 @@ final class ConnectionViewModel: ObservableObject {
 
     var isConnected: Bool { state.isConnected }
     var supportsQueueV1: Bool {
-        pairedDevice?.features?.contains("queue_crud_v1") == true
+        let features = Set(pairedDevice?.features ?? [])
+        return ["queue_crud_v1", "stable_item_ids", "command_results"]
+            .allSatisfy(features.contains)
     }
 
     func cast(urlString: String, title: String? = nil) {

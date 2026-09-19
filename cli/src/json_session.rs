@@ -8,7 +8,7 @@ use std::{
 };
 
 const STALE_AFTER: Duration = Duration::from_secs(4);
-const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const ACK_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {

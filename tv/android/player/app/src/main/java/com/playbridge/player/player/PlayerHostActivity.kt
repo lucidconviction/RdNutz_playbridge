@@ -236,6 +236,7 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
 
         override fun seekTo(positionMs: Long) = this@PlayerHostActivity.seekTo(positionMs)
     }
+    private var deferQueueCommandPlaylistStatus = false
     private val playbackCoordinator by lazy {
         PlaybackCoordinator(object : PlaybackCoordinator.Host {
             override fun loadItem(item: PlayPayload, displayTitle: String?) {
@@ -247,7 +248,9 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
             }
 
             override fun onPlaylistChanged(items: List<PlayPayload>, index: Int) {
-                broadcastPlaylistStatus(items, index)
+                if (!deferQueueCommandPlaylistStatus) {
+                    broadcastPlaylistStatus(items, index)
+                }
             }
 
             override fun showMessage(message: String) {
@@ -1944,7 +1947,9 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
     }
 
     private suspend fun applyQueueCommand(command: ServerService.Companion.PendingQueueCommand) {
-        val result = when (val message = command.message) {
+        deferQueueCommandPlaylistStatus = command.requestId != null
+        val result = try {
+            when (val message = command.message) {
             is com.playbridge.shared.protocol.IncomingMessage.QueueAdd -> {
                 val items = buildList {
                     message.payload.item?.let(::add)
@@ -1955,14 +1960,10 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
             is com.playbridge.shared.protocol.IncomingMessage.PlaylistJump -> {
                 message.payload.item_id?.let {
                     playbackCoordinator.jumpToItem(it, message.payload.if_playback_id)
-                } ?: run {
-                    if (message.payload.index !in playbackCoordinator.playlist.indices) {
-                        PlaybackCoordinator.MutationResult.ItemNotFound
-                    } else {
-                        playbackCoordinator.jumpTo(message.payload.index)
-                        PlaybackCoordinator.MutationResult.Applied
-                    }
-                }
+                } ?: playbackCoordinator.jumpToIndex(
+                    message.payload.index,
+                    message.payload.if_playback_id,
+                )
             }
             is com.playbridge.shared.protocol.IncomingMessage.QueueRemove ->
                 playbackCoordinator.remove(message.payload.item_ids.toSet(), message.payload.if_playback_id)
@@ -1977,13 +1978,12 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
                     if (it == PlaybackCoordinator.MutationResult.Applied) handleControl("stop")
                 }
             is com.playbridge.shared.protocol.IncomingMessage.QueueQuery -> {
-                ServerService.sendQueueSnapshot(
-                    command,
-                    playlistStatusJson(playbackCoordinator.playlist, playbackCoordinator.index),
-                )
                 PlaybackCoordinator.MutationResult.Applied
             }
             else -> PlaybackCoordinator.MutationResult.InvalidCommand
+            }
+        } finally {
+            deferQueueCommandPlaylistStatus = false
         }
         val error = when (result) {
             PlaybackCoordinator.MutationResult.Applied -> null
@@ -1999,6 +1999,14 @@ class PlayerHostActivity : ComponentActivity(), PlaybackProgressSource {
             error = error,
             playbackId = playbackCoordinator.playbackId,
             queueRevision = playbackCoordinator.queueRevision,
+            playlistStatusJson = if (
+                error == null &&
+                (command.requestId != null || command.message is com.playbridge.shared.protocol.IncomingMessage.QueueQuery)
+            ) {
+                playlistStatusJson(playbackCoordinator.playlist, playbackCoordinator.index)
+            } else {
+                null
+            },
         )
     }
 

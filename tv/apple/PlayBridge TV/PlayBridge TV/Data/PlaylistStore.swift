@@ -61,18 +61,22 @@ class PlaylistStore: ObservableObject {
     func next() -> Playbridge_PlayPayload? {
         guard hasNext else { return nil }
         currentIndex += 1
+        queueRevision &+= 1
         return currentItem
     }
 
     func previous() -> Playbridge_PlayPayload? {
         guard hasPrevious else { return nil }
         currentIndex -= 1
+        queueRevision &+= 1
         return currentItem
     }
 
     func jumpTo(index: Int) -> Playbridge_PlayPayload? {
         guard index >= 0, index < items.count else { return nil }
+        guard index != currentIndex else { return currentItem }
         currentIndex = index
+        queueRevision &+= 1
         return currentItem
     }
 

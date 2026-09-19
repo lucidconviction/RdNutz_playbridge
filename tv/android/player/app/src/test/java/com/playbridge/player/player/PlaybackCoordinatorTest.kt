@@ -59,6 +59,7 @@ class PlaybackCoordinatorTest {
         val c = PlaybackCoordinator(host)
         c.setPlaylist(three, 0)
 
+        val revision = c.queueRevision
         c.next()
 
         assertEquals(1, c.index)
@@ -67,6 +68,7 @@ class PlaybackCoordinatorTest {
         assertEquals(listOf(true), host.savedThumbnailFlags)
         assertTrue(host.playlistChangedCount > 0)
         assertFalse(host.finished)
+        assertEquals(revision + 1, c.queueRevision)
     }
 
     @Test
@@ -95,10 +97,12 @@ class PlaybackCoordinatorTest {
         val c = PlaybackCoordinator(host)
         c.setPlaylist(three, 2)
 
+        val revision = c.queueRevision
         c.previous()
 
         assertEquals(1, c.index)
         assertEquals(three[1], host.loaded.single().first)
+        assertEquals(revision + 1, c.queueRevision)
     }
 
     @Test
@@ -120,11 +124,26 @@ class PlaybackCoordinatorTest {
         val c = PlaybackCoordinator(host)
         c.setPlaylist(three, 0)
 
+        val revision = c.queueRevision
         c.jumpTo(2)
 
         assertEquals(2, c.index)
         assertEquals(three[2], host.loaded.single().first)
         assertEquals(listOf(false), host.savedThumbnailFlags)
+        assertEquals(revision + 1, c.queueRevision)
+    }
+
+    @Test
+    fun `guarded index jump rejects stale playback`() = runTest {
+        val host = FakeHost()
+        val c = PlaybackCoordinator(host)
+        c.setPlaylist(three, 0, replacementId = "current")
+
+        val result = c.jumpToIndex(2, ifPlaybackId = "stale")
+
+        assertEquals(PlaybackCoordinator.MutationResult.StalePlayback, result)
+        assertEquals(0, c.index)
+        assertTrue(host.loaded.isEmpty())
     }
 
     @Test

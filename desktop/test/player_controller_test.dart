@@ -178,9 +178,71 @@ void main() {
 
     expect(await controller.jumpToItem(secondId), isTrue);
     expect(controller.currentItemId, secondId);
+    expect(controller.queueRevision, initialRevision + 3);
     expect(await controller.removeQueueItems({secondId}), isTrue);
     expect(controller.currentItemId, isNot(secondId));
     expect(controller.queueItemIds, isNot(contains(secondId)));
+  });
+
+  test('guarded index jump advances the queue revision exactly once', () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1), item(2)], 0);
+    final playbackId = controller.playbackId;
+    final revision = controller.queueRevision;
+
+    expect(
+      await controller.jumpToGuarded(1, ifPlaybackId: playbackId),
+      isTrue,
+    );
+
+    expect(controller.currentIndex, 1);
+    expect(controller.queueRevision, revision + 1);
+  });
+
+  test('queue append rejects batches larger than 50 without mutation',
+      () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1)], 0);
+    final revision = controller.queueRevision;
+
+    expect(
+      await controller.queueAddAll(
+        List.generate(51, (index) => item(index + 2)),
+      ),
+      isFalse,
+    );
+
+    expect(controller.queue.length, 1);
+    expect(controller.queueRevision, revision);
+  });
+
+  test('queue append rejects a resulting queue larger than 200', () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist(List.generate(200, item), 0);
+    final revision = controller.queueRevision;
+
+    expect(await controller.queueAddAll([item(201)]), isFalse);
+
+    expect(controller.queue.length, 200);
+    expect(controller.queueRevision, revision);
+  });
+
+  test(
+      'playlist replacement rejects more than 200 items without changing playback',
+      () async {
+    final controller = PlayerController(engineForTest: _FakeEngine());
+    await controller.playPlaylist([item(1)], 0);
+    final playbackId = controller.playbackId;
+    final revision = controller.queueRevision;
+
+    await expectLater(
+      controller.playPlaylist(List.generate(201, (index) => item(index)), 0),
+      throwsArgumentError,
+    );
+
+    expect(controller.playbackId, playbackId);
+    expect(controller.queue.length, 1);
+    expect(controller.queueRevision, revision);
   });
 
   test('batch removal and move-before preserve the active item identity',

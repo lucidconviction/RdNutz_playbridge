@@ -2,8 +2,30 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:playbridge_desktop/protocol.dart';
+import 'package:playbridge_desktop/receiver_server.dart';
 
 void main() {
+  test('queue add failure reports asynchronous playback replacement', () {
+    expect(
+      queueAddFailureError(
+        startingPlaybackId: 'playback-1',
+        currentPlaybackId: 'playback-2',
+        queueLength: 3,
+        itemCount: 1,
+      ),
+      'stale_playback',
+    );
+    expect(
+      queueAddFailureError(
+        startingPlaybackId: 'playback-1',
+        currentPlaybackId: null,
+        queueLength: 0,
+        itemCount: 1,
+      ),
+      'no_active_playback',
+    );
+  });
+
   test('parses the playlist pre-play preference', () {
     final command = parseCommand(jsonEncode({
       'type': 'command',

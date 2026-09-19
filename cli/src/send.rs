@@ -352,10 +352,29 @@ async fn prepare_queue_item(
     payload: &mut Value,
     proxy_server: &mut Option<ProxyServer>,
 ) -> Result<(), String> {
-    let item = payload
-        .get_mut("item")
-        .and_then(Value::as_object_mut)
-        .ok_or("queue_add requires item")?;
+    if let Some(item) = payload.get_mut("item") {
+        return prepare_queue_item_value(item, proxy_server).await;
+    }
+    let items = payload
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or("queue_add requires item or items")?;
+    if items.is_empty() {
+        return Err("queue_add requires at least one item".into());
+    }
+    for item in items {
+        prepare_queue_item_value(item, proxy_server).await?;
+    }
+    Ok(())
+}
+
+async fn prepare_queue_item_value(
+    value: &mut Value,
+    proxy_server: &mut Option<ProxyServer>,
+) -> Result<(), String> {
+    let item = value
+        .as_object_mut()
+        .ok_or("queue item must be an object")?;
     let url = item
         .get("url")
         .and_then(Value::as_str)
@@ -592,7 +611,7 @@ pub(crate) async fn run_json_pair(
     let was_paired = PlaybridgeCredentials::load(&uuid).is_some();
     let empty_payload = json!({ "items": [] });
     let pair_path = pair_code_file.as_deref().map(PathBuf::from);
-    let socket = cast_to_playbridge_maybe_pair(
+    let (socket, _) = cast_to_playbridge_maybe_pair(
         &address,
         receiver.wss_port.or(receiver.port).unwrap_or(8765),
         PlaybridgeLoad {
@@ -891,6 +910,154 @@ enum JsonControlResult {
     Detach,
 }
 
+#[derive(Debug, PartialEq)]
+enum ManagedCommandResult {
+    Pending,
+    Accepted {
+        playback_id: Option<String>,
+        queue_revision: Option<u64>,
+    },
+    Rejected(String),
+}
+
+fn managed_command_requires_confirmation(action: &str) -> bool {
+    matches!(
+        action,
+        "queue_add"
+            | "playlist_jump"
+            | "queue_query"
+            | "queue_remove"
+            | "queue_move"
+            | "queue_clear"
+    )
+}
+
+fn managed_command_invalidates_media_mapping(action: &str) -> bool {
+    matches!(
+        action,
+        "queue_add" | "queue_remove" | "queue_move" | "queue_clear"
+    )
+}
+
+fn managed_command_result(frame: &ReceiverFrame, request_id: &str) -> ManagedCommandResult {
+    let ReceiverFrame::CommandResult {
+        request_id: result_request_id,
+        ok,
+        error,
+        message,
+        playback_id,
+        queue_revision,
+    } = frame
+    else {
+        return ManagedCommandResult::Pending;
+    };
+    if result_request_id != request_id {
+        return ManagedCommandResult::Pending;
+    }
+    if *ok {
+        ManagedCommandResult::Accepted {
+            playback_id: playback_id.clone(),
+            queue_revision: *queue_revision,
+        }
+    } else {
+        ManagedCommandResult::Rejected(
+            message
+                .clone()
+                .or_else(|| error.clone())
+                .unwrap_or_else(|| "receiver rejected command".into()),
+        )
+    }
+}
+
+fn update_snapshot_from_receiver_frame(snapshot: &mut CastSnapshot, frame: &ReceiverFrame) {
+    match frame {
+        ReceiverFrame::Status {
+            state,
+            position,
+            duration,
+            title,
+            ..
+        } => {
+            snapshot.state = state.clone();
+            snapshot.position_ms = *position;
+            snapshot.duration_ms = *duration;
+            if let Some(title) = title {
+                snapshot.title = title.clone();
+            }
+        }
+        ReceiverFrame::PlaylistStatus {
+            items,
+            current_index,
+            total_count,
+            ..
+        } => {
+            snapshot.current_index = Some(*current_index);
+            snapshot.total_count = Some(*total_count);
+            if let Some(item) = items.iter().find(|item| item.index == *current_index) {
+                snapshot.title = item.title.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn send_confirmed_managed_command(
+    socket: &mut SecureWebSocket,
+    snapshot: &mut CastSnapshot,
+    request_id: &str,
+    action: &str,
+    payload: Option<Value>,
+) -> Result<(), String> {
+    socket
+        .send_command(action, payload, Some(request_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut accepted = None;
+    let mut playlist_snapshot = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("receiver does not support confirmed receiver commands".into());
+        }
+        let frame = match tokio::time::timeout(deadline - now, socket.receive()).await {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => return Err("receiver closed connection during command".into()),
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => return Err("receiver does not support confirmed receiver commands".into()),
+        };
+        if let ReceiverFrame::PlaylistStatus {
+            playback_id,
+            queue_revision,
+            ..
+        } = &frame
+        {
+            playlist_snapshot = Some((playback_id.clone(), *queue_revision));
+        }
+        update_snapshot_from_receiver_frame(snapshot, &frame);
+        match managed_command_result(&frame, request_id) {
+            ManagedCommandResult::Pending => {}
+            ManagedCommandResult::Accepted {
+                playback_id,
+                queue_revision,
+            } => accepted = Some((playback_id, queue_revision)),
+            ManagedCommandResult::Rejected(error) => return Err(error),
+        }
+        if let (Some((result_playback_id, result_revision)), Some((snapshot_id, snapshot_revision))) =
+            (&accepted, &playlist_snapshot)
+            && confirmation_matches_snapshot(
+                true,
+                result_playback_id.as_deref(),
+                *result_revision,
+                snapshot_id.as_deref(),
+                *snapshot_revision,
+            )
+        {
+            return Ok(());
+        }
+    }
+}
+
 async fn apply_json_control(
     control: &mut TargetControl,
     snapshot: &mut CastSnapshot,
@@ -910,30 +1077,41 @@ async fn apply_json_control(
             let queued_media = if action == "queue_add" {
                 payload
                     .as_ref()
-                    .and_then(|payload| payload.get("item"))
-                    .and_then(|item| item.get("url"))
-                    .and_then(Value::as_str)
-                    .map(display_media_target)
+                    .map(queue_media_targets)
+                    .unwrap_or_default()
             } else {
-                None
+                Vec::new()
             };
             if action == "queue_add"
                 && let Some(payload) = payload.as_mut()
             {
                 prepare_queue_item(payload, proxy_server).await?;
             }
-            let TargetControl::Playbridge(socket) = control else {
+            let TargetControl::Playbridge { socket, features } = control else {
                 return Err("receiver commands require a PlayBridge session".into());
             };
-            socket
-                .send(&SenderFrame::Command {
-                    action: action.to_owned(),
-                    payload,
-                })
-                .await
-                .map_err(|error| error.to_string())?;
-            if let Some(media) = queued_media {
-                media_items.push(media);
+            if managed_command_requires_confirmation(action) {
+                if !supports_confirmed_queue_crud(features) {
+                    return Err("receiver does not support confirmed queue CRUD v1".into());
+                }
+                send_confirmed_managed_command(socket, snapshot, &request.id, action, payload)
+                    .await?;
+            } else {
+                socket
+                    .send(&SenderFrame::Command {
+                        action: action.to_owned(),
+                        payload,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            if managed_command_invalidates_media_mapping(action) {
+                // Receiver-owned CRUD can deduplicate, remove, and reorder entries. The
+                // compact authoritative snapshot intentionally carries no URLs, so the
+                // original sender URL vector can no longer be indexed safely.
+                media_items.clear();
+            } else if action == "queue_add" {
+                media_items.extend(queued_media);
                 snapshot.total_count = Some(media_items.len());
             }
             Ok(JsonControlResult::Applied)
@@ -991,6 +1169,20 @@ async fn apply_json_control(
     }
 }
 
+fn queue_media_targets(payload: &Value) -> Vec<String> {
+    let values: Vec<&Value> = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .or_else(|| payload.get("item").map(|item| vec![item]))
+        .unwrap_or_default();
+    values
+        .into_iter()
+        .filter_map(|item| item.get("url").and_then(Value::as_str))
+        .map(display_media_target)
+        .collect()
+}
+
 async fn json_seek(
     control: &mut TargetControl,
     snapshot: &mut CastSnapshot,
@@ -1003,7 +1195,7 @@ async fn json_seek(
         position_ms = position_ms.min(snapshot.duration_ms);
     }
     match control {
-        TargetControl::Playbridge(socket) => {
+        TargetControl::Playbridge { socket, .. } => {
             socket
                 .send(&SenderFrame::Command {
                     action: "control".into(),
@@ -1329,7 +1521,7 @@ pub(crate) async fn run_device_receiver_command(
         ));
     }
     let empty_payload = json!({ "items": [] });
-    let mut socket = cast_to_playbridge(
+    let (mut socket, features) = cast_to_playbridge_with_features(
         &address,
         receiver.wss_port.or(receiver.port).unwrap_or(8765),
         PlaybridgeLoad {
@@ -1343,6 +1535,10 @@ pub(crate) async fn run_device_receiver_command(
         },
     )
     .await?;
+    if requires_v1 && !supports_confirmed_queue_crud(&features) {
+        let _ = socket.close().await;
+        return Err("receiver does not support confirmed queue CRUD v1".into());
+    }
     let request_id = crate::json_session::new_request_id();
     socket
         .send_command(action, Some(payload), Some(&request_id))
@@ -1357,6 +1553,7 @@ pub(crate) async fn run_device_receiver_command(
         .map_err(|error| error.to_string())?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let use_legacy_snapshot_deadline = uses_legacy_snapshot_deadline(&features);
     let mut snapshot = None;
     let mut command_result: Option<CommandConfirmation> = None;
     let mut legacy_deadline: Option<tokio::time::Instant> = None;
@@ -1384,14 +1581,27 @@ pub(crate) async fn run_device_receiver_command(
                         queue_revision,
                         current_item_id,
                     ));
-                    legacy_deadline
-                        .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(1));
+                    if use_legacy_snapshot_deadline {
+                        legacy_deadline
+                            .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(1));
+                    }
                     if let Some((ok, error, message, result_playback_id, result_revision)) =
-                        command_result.take()
-                        && (!ok
-                            || result_revision.is_none_or(|revision| revision == queue_revision))
+                        command_result.as_ref()
+                        && confirmation_matches_snapshot(
+                            *ok,
+                            result_playback_id.as_deref(),
+                            *result_revision,
+                            snapshot.as_ref().and_then(|value| value.3.as_deref()),
+                            queue_revision,
+                        )
                     {
-                        break Some((ok, error, message, result_playback_id, result_revision));
+                        break Some((
+                            *ok,
+                            error.clone(),
+                            message.clone(),
+                            result_playback_id.clone(),
+                            *result_revision,
+                        ));
                     }
                 }
                 ReceiverFrame::CommandResult {
@@ -1402,10 +1612,15 @@ pub(crate) async fn run_device_receiver_command(
                     playback_id,
                     queue_revision,
                 } if result_request_id == request_id => {
-                    if !ok
-                        || snapshot.as_ref().is_some_and(|value| {
-                            queue_revision.is_none_or(|revision| revision == value.4)
-                        })
+                    if snapshot.as_ref().is_some_and(|value| {
+                        confirmation_matches_snapshot(
+                            ok,
+                            playback_id.as_deref(),
+                            queue_revision,
+                            value.3.as_deref(),
+                            value.4,
+                        )
+                    }) || !ok
                     {
                         break Some((ok, error, message, playback_id, queue_revision));
                     }
@@ -1431,6 +1646,15 @@ pub(crate) async fn run_device_receiver_command(
             .or(error)
             .unwrap_or_else(|| "receiver rejected command".into()));
     }
+    snapshot = snapshot.filter(|value| {
+        confirmation_matches_snapshot(
+            true,
+            playback_id.as_deref(),
+            queue_revision,
+            value.3.as_deref(),
+            value.4,
+        )
+    });
 
     let mut result = json!({
         "ok": true,
@@ -1462,6 +1686,31 @@ pub(crate) async fn run_device_receiver_command(
         });
     }
     Ok(result)
+}
+
+fn supports_confirmed_queue_crud(features: &[String]) -> bool {
+    features.iter().any(|feature| feature == "queue_crud_v1")
+        && features.iter().any(|feature| feature == "stable_item_ids")
+        && supports_command_results(features)
+}
+
+fn supports_command_results(features: &[String]) -> bool {
+    features.iter().any(|feature| feature == "command_results")
+}
+
+fn uses_legacy_snapshot_deadline(features: &[String]) -> bool {
+    !supports_command_results(features)
+}
+
+fn confirmation_matches_snapshot(
+    ok: bool,
+    result_playback_id: Option<&str>,
+    result_revision: Option<u64>,
+    snapshot_playback_id: Option<&str>,
+    snapshot_revision: u64,
+) -> bool {
+    !ok || (result_revision.is_none_or(|revision| snapshot_revision >= revision)
+        && result_playback_id.is_none_or(|id| snapshot_playback_id == Some(id)))
 }
 
 async fn select_discovered_receiver(
@@ -1605,23 +1854,25 @@ async fn connect_and_load(
         ReceiverProtocol::PlayBridge => {
             let port = receiver.wss_port.or(receiver.port).unwrap_or(8765);
             let uuid = receiver_uuid(&receiver);
-            TargetControl::Playbridge(Box::new(
-                cast_to_playbridge_maybe_pair(
-                    &address,
-                    port,
-                    PlaybridgeLoad {
-                        device_name: &receiver.name,
-                        device_uuid: &uuid,
-                        media_url,
-                        media_title,
-                        skip_history: false,
-                        playlist_payload: Some(playlist_payload),
-                        pair_only: false,
-                    },
-                    pairing,
-                )
-                .await?,
-            ))
+            let (socket, features) = cast_to_playbridge_maybe_pair(
+                &address,
+                port,
+                PlaybridgeLoad {
+                    device_name: &receiver.name,
+                    device_uuid: &uuid,
+                    media_url,
+                    media_title,
+                    skip_history: false,
+                    playlist_payload: Some(playlist_payload),
+                    pair_only: false,
+                },
+                pairing,
+            )
+            .await?;
+            TargetControl::Playbridge {
+                socket: Box::new(socket),
+                features,
+            }
         }
         _ => cast_to_target(
             protocol.as_str(),
@@ -1706,9 +1957,9 @@ async fn cast_to_playbridge_maybe_pair(
     wss_port: u16,
     load: PlaybridgeLoad<'_>,
     machine_pairing: MachinePairing<'_>,
-) -> Result<SecureWebSocket, String> {
+) -> Result<(SecureWebSocket, Vec<String>), String> {
     if PlaybridgeCredentials::load(load.device_uuid).is_some() {
-        return cast_to_playbridge(address, wss_port, load).await;
+        return cast_to_playbridge_with_features(address, wss_port, load).await;
     }
 
     let endpoint = playbridge_cast_core::net::wss_endpoint(address, wss_port);
@@ -1756,6 +2007,7 @@ async fn cast_to_playbridge_maybe_pair(
                 let bundle = pairing
                     .decrypt_credentials(&nonce, &ciphertext, Some(&served_pin))
                     .map_err(|error| error.to_string())?;
+                let features = bundle.features.clone();
                 let credentials = PlaybridgeCredentials {
                     token: bundle.token,
                     cert_fingerprint: bundle
@@ -1770,7 +2022,7 @@ async fn cast_to_playbridge_maybe_pair(
                 if !load.pair_only {
                     send_load(&mut socket, load).await?;
                 }
-                return Ok(socket);
+                return Ok((socket, features));
             }
             ReceiverFrame::PairingDenied => {
                 return Err("Pairing was denied or timed out on the receiver".into());
@@ -1820,27 +2072,29 @@ pub(crate) async fn run_dashboard_cast(
         "playbridge" | "native" => {
             let port = target.wss_port.or(target.port).unwrap_or(8765);
             let uuid = target.uuid.clone().unwrap_or_else(|| target.id.0.clone());
-            TargetControl::Playbridge(Box::new(
-                cast_to_playbridge_dashboard(
-                    &address,
-                    port,
-                    PlaybridgeLoad {
-                        device_name: &target.name,
-                        device_uuid: &uuid,
-                        media_url: &media_url,
-                        media_title: &dashboard_title,
-                        skip_history,
-                        playlist_payload: None,
-                        pair_only: false,
-                    },
-                    DashboardPairing {
-                        generation,
-                        commands: &mut commands,
-                        events: &events,
-                    },
-                )
-                .await?,
-            ))
+            let (socket, features) = cast_to_playbridge_dashboard(
+                &address,
+                port,
+                PlaybridgeLoad {
+                    device_name: &target.name,
+                    device_uuid: &uuid,
+                    media_url: &media_url,
+                    media_title: &dashboard_title,
+                    skip_history,
+                    playlist_payload: None,
+                    pair_only: false,
+                },
+                DashboardPairing {
+                    generation,
+                    commands: &mut commands,
+                    events: &events,
+                },
+            )
+            .await?;
+            TargetControl::Playbridge {
+                socket: Box::new(socket),
+                features,
+            }
         }
         _ => cast_to_target(
             &protocol,
@@ -2188,7 +2442,10 @@ enum TargetControl {
         media_session_id: i64,
     },
     Dlna(Renderer),
-    Playbridge(Box<SecureWebSocket>),
+    Playbridge {
+        socket: Box<SecureWebSocket>,
+        features: Vec<String>,
+    },
     Roku(ReceiverSession),
     Browser {
         host: BrowserReceiverHost,
@@ -2200,7 +2457,7 @@ enum TargetControl {
 
 fn dashboard_capabilities(control: &TargetControl) -> CastCapabilities {
     match control {
-        TargetControl::Playbridge(_) => CastCapabilities {
+        TargetControl::Playbridge { .. } => CastCapabilities {
             play_pause: true,
             seek: true,
             volume: true,
@@ -2265,7 +2522,7 @@ async fn dashboard_poll(
                 }
             }
         }
-        TargetControl::Playbridge(socket) => {
+        TargetControl::Playbridge { socket, .. } => {
             if heartbeat {
                 socket
                     .send(&SenderFrame::Ping)
@@ -2395,7 +2652,7 @@ async fn dashboard_control(
                         session.play().await.map_err(|error| error.to_string())?
                     }
                 }
-                TargetControl::Playbridge(socket) => {
+                TargetControl::Playbridge { socket, .. } => {
                     socket
                         .send(&SenderFrame::Command {
                             action: "control".into(),
@@ -2448,7 +2705,7 @@ async fn dashboard_control(
                     .relative_seek(delta > 0)
                     .await
                     .map_err(|error| error.to_string())?,
-                TargetControl::Playbridge(socket) => socket
+                TargetControl::Playbridge { socket, .. } => socket
                     .send(&SenderFrame::Command {
                         action: "control".into(),
                         payload: Some(
@@ -2476,7 +2733,7 @@ async fn dashboard_control(
             let volume = (snapshot.volume.unwrap_or(0.5) + delta).clamp(0.0, 1.0);
             match control {
                 TargetControl::Cast { channel, .. } => castv2::send_volume(channel, volume).await?,
-                TargetControl::Playbridge(socket) => socket
+                TargetControl::Playbridge { socket, .. } => socket
                     .send(&SenderFrame::Command {
                         action: "remote".into(),
                         payload: Some(
@@ -2505,7 +2762,7 @@ async fn dashboard_control(
         | CastCommand::ToggleLoop
         | CastCommand::ToggleAudioBoost
         | CastCommand::SetSpeed(_) => {
-            let TargetControl::Playbridge(socket) = control else {
+            let TargetControl::Playbridge { socket, .. } = control else {
                 return unsupported();
             };
             let (action, payload) = match command {
@@ -2586,7 +2843,7 @@ async fn stop_target(target_control: TargetControl) {
         TargetControl::Dlna(renderer) => {
             let _ = renderer.stop().await;
         }
-        TargetControl::Playbridge(mut socket) => {
+        TargetControl::Playbridge { mut socket, .. } => {
             let cmd = SenderFrame::Command {
                 action: "control".into(),
                 payload: Some(serde_json::json!({ "command": "stop" })),
@@ -2708,11 +2965,11 @@ async fn cast_to_target(
     }
 }
 
-async fn cast_to_playbridge(
+async fn cast_to_playbridge_with_features(
     address: &str,
     wss_port: u16,
     load: PlaybridgeLoad<'_>,
-) -> Result<SecureWebSocket, String> {
+) -> Result<(SecureWebSocket, Vec<String>), String> {
     let mut credentials = PlaybridgeCredentials::load(load.device_uuid)
         .ok_or_else(|| format!("{} has no stored pairing credentials", load.device_name))?;
     let endpoint = playbridge_cast_core::net::wss_endpoint(address, wss_port);
@@ -2726,16 +2983,20 @@ async fn cast_to_playbridge(
         .await
         .map_err(|error| error.to_string())?;
 
-    loop {
+    let features = loop {
         match socket.receive().await.map_err(|error| error.to_string())? {
-            Some(ReceiverFrame::AuthResponse { success: true, .. }) => break,
+            Some(ReceiverFrame::AuthResponse {
+                success: true,
+                features,
+                ..
+            }) => break features,
             Some(ReceiverFrame::AuthResponse { success: false, .. }) => {
                 return Err("credentials_rejected".into());
             }
             Some(_) => {}
             None => return Err("Receiver closed connection during auth".into()),
         }
-    }
+    };
 
     credentials.receiver_name = Some(load.device_name.to_owned());
     credentials.last_used_at = Some(now_seconds());
@@ -2744,7 +3005,7 @@ async fn cast_to_playbridge(
     if !load.pair_only {
         send_load(&mut socket, load).await?;
     }
-    Ok(socket)
+    Ok((socket, features))
 }
 
 struct DashboardPairing<'a> {
@@ -2758,14 +3019,14 @@ async fn cast_to_playbridge_dashboard(
     wss_port: u16,
     load: PlaybridgeLoad<'_>,
     pairing_ui: DashboardPairing<'_>,
-) -> Result<SecureWebSocket, String> {
+) -> Result<(SecureWebSocket, Vec<String>), String> {
     let DashboardPairing {
         generation,
         commands,
         events,
     } = pairing_ui;
     if PlaybridgeCredentials::load(load.device_uuid).is_some() {
-        return cast_to_playbridge(address, wss_port, load).await;
+        return cast_to_playbridge_with_features(address, wss_port, load).await;
     }
 
     let endpoint = playbridge_cast_core::net::wss_endpoint(address, wss_port);
@@ -2842,6 +3103,7 @@ async fn cast_to_playbridge_dashboard(
                 let bundle = pairing
                     .decrypt_credentials(&nonce, &ciphertext, Some(&served_pin))
                     .map_err(|error| error.to_string())?;
+                let features = bundle.features.clone();
                 let credentials = PlaybridgeCredentials {
                     token: bundle.token,
                     cert_fingerprint: bundle
@@ -2863,7 +3125,7 @@ async fn cast_to_playbridge_dashboard(
                 if !load.pair_only {
                     send_load(&mut socket, load).await?;
                 }
-                return Ok(socket);
+                return Ok((socket, features));
             }
             ReceiverFrame::PairingDenied => {
                 return Err("Pairing was denied by the receiver".into());
@@ -2925,6 +3187,164 @@ mod tests {
         .unwrap();
 
         assert!(preserved.exists());
+    }
+
+    #[tokio::test]
+    async fn managed_queue_preparation_accepts_batch_payloads() {
+        let mut payload = json!({
+            "items": [
+                {"url": "https://example.test/one.mp4"},
+                {"url": "https://example.test/two.mp4"}
+            ],
+            "ifPlaybackId": "playback-1"
+        });
+        let mut proxy = None;
+
+        prepare_queue_item(&mut payload, &mut proxy).await.unwrap();
+
+        assert!(proxy.is_none());
+        assert_eq!(queue_media_targets(&payload).len(), 2);
+    }
+
+    #[test]
+    fn guarded_queue_commands_require_all_receiver_features() {
+        assert!(!supports_confirmed_queue_crud(&["queue_crud_v1".into()]));
+        assert!(!supports_confirmed_queue_crud(&["command_results".into()]));
+        assert!(!supports_confirmed_queue_crud(&[
+            "queue_crud_v1".into(),
+            "command_results".into(),
+        ]));
+        assert!(supports_confirmed_queue_crud(&[
+            "queue_crud_v1".into(),
+            "stable_item_ids".into(),
+            "command_results".into(),
+        ]));
+    }
+
+    #[test]
+    fn advertised_command_results_disable_the_legacy_snapshot_deadline() {
+        assert!(!uses_legacy_snapshot_deadline(&["command_results".into()]));
+        assert!(uses_legacy_snapshot_deadline(&["queue_crud_v1".into()]));
+    }
+
+    #[test]
+    fn managed_receiver_commands_only_accept_the_matching_result() {
+        let accepted = ReceiverFrame::CommandResult {
+            request_id: "current".into(),
+            ok: true,
+            error: None,
+            message: None,
+            playback_id: Some("playback-1".into()),
+            queue_revision: Some(4),
+        };
+        assert_eq!(
+            managed_command_result(&accepted, "other"),
+            ManagedCommandResult::Pending
+        );
+        assert_eq!(
+            managed_command_result(&accepted, "current"),
+            ManagedCommandResult::Accepted {
+                playback_id: Some("playback-1".into()),
+                queue_revision: Some(4),
+            }
+        );
+
+        let rejected = ReceiverFrame::CommandResult {
+            request_id: "current".into(),
+            ok: false,
+            error: Some("queue_full".into()),
+            message: None,
+            playback_id: Some("playback-1".into()),
+            queue_revision: Some(4),
+        };
+        assert_eq!(
+            managed_command_result(&rejected, "current"),
+            ManagedCommandResult::Rejected("queue_full".into())
+        );
+    }
+
+    #[test]
+    fn only_queue_v1_commands_require_receiver_confirmation() {
+        for action in [
+            "queue_add",
+            "playlist_jump",
+            "queue_query",
+            "queue_remove",
+            "queue_move",
+            "queue_clear",
+        ] {
+            assert!(managed_command_requires_confirmation(action), "{action}");
+        }
+
+        for action in ["browser", "browser_control", "remote", "control"] {
+            assert!(!managed_command_requires_confirmation(action), "{action}");
+        }
+    }
+
+    #[test]
+    fn read_only_and_navigation_commands_preserve_media_mapping() {
+        for action in ["queue_query", "playlist_jump"] {
+            assert!(
+                !managed_command_invalidates_media_mapping(action),
+                "{action}"
+            );
+        }
+        for action in ["queue_add", "queue_remove", "queue_move", "queue_clear"] {
+            assert!(
+                managed_command_invalidates_media_mapping(action),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_receiver_command_updates_status_while_waiting_for_confirmation() {
+        let mut snapshot = CastSnapshot {
+            state: "buffering".into(),
+            title: "old".into(),
+            position_ms: 0,
+            duration_ms: 0,
+            current_index: Some(0),
+            total_count: Some(1),
+            volume: None,
+            muted: None,
+            looping: None,
+            speed: None,
+        };
+        update_snapshot_from_receiver_frame(
+            &mut snapshot,
+            &ReceiverFrame::Status {
+                state: "playing".into(),
+                position: 1_000,
+                duration: 10_000,
+                title: Some("new".into()),
+                media_kind: Some("video".into()),
+                playback_id: Some("playback-1".into()),
+                current_item_id: Some("item-1".into()),
+            },
+        );
+        assert_eq!(snapshot.state, "playing");
+        assert_eq!(snapshot.title, "new");
+        assert_eq!(snapshot.position_ms, 1_000);
+        assert_eq!(snapshot.duration_ms, 10_000);
+    }
+
+    #[test]
+    fn command_confirmation_accepts_newer_same_playback_snapshot() {
+        assert!(confirmation_matches_snapshot(
+            true,
+            Some("playback-1"),
+            Some(4),
+            Some("playback-1"),
+            5,
+        ));
+        assert!(!confirmation_matches_snapshot(
+            true,
+            Some("playback-1"),
+            Some(4),
+            Some("playback-2"),
+            5,
+        ));
     }
 
     #[test]

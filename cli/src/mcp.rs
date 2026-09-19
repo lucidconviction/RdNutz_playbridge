@@ -1136,7 +1136,7 @@ impl PlaybridgeMcp {
                     .map_err(|error| error.to_string())?;
                 read_matching_ack(&mut managed.stdout, &request_id).await
             };
-            let error = match tokio::time::timeout(Duration::from_secs(5), result).await {
+            let error = match tokio::time::timeout(Duration::from_secs(12), result).await {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => error,
                 Err(_) => "control_timeout".to_owned(),

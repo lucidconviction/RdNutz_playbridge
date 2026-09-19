@@ -13,6 +13,9 @@ import 'extension_request_debug_log.dart';
 
 /// Coordinator that delegates playback to the active [PlayerEngine].
 class PlayerController extends ChangeNotifier {
+  static const int maxQueueItems = 200;
+  static const int maxQueueBatchItems = 50;
+
   /// [engineForTest] injects a fake engine (unit tests); production leaves it null.
   PlayerController({
     EngineType initialEngine = EngineType.mpvInternal,
@@ -263,6 +266,10 @@ class PlayerController extends ChangeNotifier {
   }) async {
     await _waitForProxyToggle();
     if (items.isEmpty) return;
+    if (items.length > maxQueueItems) {
+      throw ArgumentError.value(
+          items.length, 'items', 'maximum queue size is $maxQueueItems');
+    }
     for (var index = 0; index < items.length; index++) {
       debugLogNetworkRequest(
         source: 'player',
@@ -314,12 +321,14 @@ class PlayerController extends ChangeNotifier {
     String? ifPlaybackId,
   }) async {
     if (items.isEmpty) return true;
+    if (items.length > maxQueueBatchItems) return false;
     await _waitForProxyToggle();
     if (ifPlaybackId != null && ifPlaybackId != _playbackId) return false;
     if (_currentIndex < 0 || _queue.isEmpty) {
       await playPlaylist(items, 0, isRemote: isRemote);
       return true;
     }
+    if (_queue.length + items.length > maxQueueItems) return false;
     final targetPlaybackId = _playbackId;
     final mode = store?.streamProxyMode ?? StreamProxyMode.off;
     final prepared = await Future.wait(
@@ -329,6 +338,7 @@ class PlayerController extends ChangeNotifier {
         (ifPlaybackId != null && ifPlaybackId != _playbackId)) {
       return false;
     }
+    if (_queue.length + prepared.length > maxQueueItems) return false;
     _queue.addAll(prepared);
     _queueItemIds
         .addAll(List.generate(prepared.length, (_) => const Uuid().v4()));
@@ -343,7 +353,7 @@ class PlayerController extends ChangeNotifier {
     if (ifPlaybackId != null && ifPlaybackId != _playbackId) return false;
     final index = _queueItemIds.indexOf(itemId);
     if (index < 0) return false;
-    await jumpTo(index);
+    await _jumpToReady(index);
     return true;
   }
 
@@ -351,8 +361,7 @@ class PlayerController extends ChangeNotifier {
     await _waitForProxyToggle();
     if (ifPlaybackId != null && ifPlaybackId != _playbackId) return false;
     if (index < 0 || index >= _queue.length) return false;
-    _setIndex(index);
-    await _openCurrentItem();
+    await _jumpToReady(index);
     return true;
   }
 
@@ -418,8 +427,14 @@ class PlayerController extends ChangeNotifier {
 
   Future<void> jumpTo(int index) async {
     await _waitForProxyToggle();
+    await _jumpToReady(index);
+  }
+
+  Future<void> _jumpToReady(int index) async {
     if (index < 0 || index >= _queue.length) return;
+    if (index == _currentIndex) return;
     _setIndex(index);
+    _queueRevision++;
     await _openCurrentItem();
   }
 

@@ -15,6 +15,21 @@ import 'extension_request_debug_log.dart';
 
 const int kDefaultPort = PairingStore.defaultReceiverPort;
 
+@visibleForTesting
+String queueAddFailureError({
+  required String? startingPlaybackId,
+  required String? currentPlaybackId,
+  required int queueLength,
+  required int itemCount,
+}) {
+  if (currentPlaybackId == null) return 'no_active_playback';
+  if (currentPlaybackId != startingPlaybackId) return 'stale_playback';
+  if (queueLength + itemCount > PlayerController.maxQueueItems) {
+    return 'queue_full';
+  }
+  return 'invalid_command';
+}
+
 enum PairingPhase {
   idle,
   awaitingApproval,
@@ -338,12 +353,13 @@ class ReceiverServer extends ChangeNotifier {
               ok: false, error: 'stale_playback');
           return;
         }
-        if (items.length > 50) {
+        if (items.length > PlayerController.maxQueueBatchItems) {
           _completeCommand(connectionId, requestId,
               ok: false, error: 'invalid_command');
           return;
         }
-        if (player.queue.length + items.length > 200) {
+        if (player.queue.length + items.length >
+            PlayerController.maxQueueItems) {
           _completeCommand(connectionId, requestId,
               ok: false, error: 'queue_full');
           return;
@@ -353,13 +369,21 @@ class ReceiverServer extends ChangeNotifier {
         } else {
           onPlaybackActivity?.call();
         }
+        final startingPlaybackId = player.playbackId;
         final added = await player.queueAddAll(
           items.map(receiverQueueItemFromPayload).toList(growable: false),
           isRemote: true,
           ifPlaybackId: ifPlaybackId,
         );
-        _completeCommand(connectionId, requestId,
-            ok: added, error: added ? null : 'stale_playback');
+        final addError = added
+            ? null
+            : queueAddFailureError(
+                startingPlaybackId: startingPlaybackId,
+                currentPlaybackId: player.playbackId,
+                queueLength: player.queue.length,
+                itemCount: items.length,
+              );
+        _completeCommand(connectionId, requestId, ok: added, error: addError);
         _sendPlaylistStatus(connectionId);
       case QueueQueryCmd():
         _sendPlaylistStatus(connectionId);

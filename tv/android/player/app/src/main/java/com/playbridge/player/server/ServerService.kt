@@ -466,9 +466,13 @@ class ServerService : Service() {
         }
         if (msg is IncomingMessage.QueueQuery && activeContext != "player") {
             val pending = PendingQueueCommand(command.connectionId, command.requestId, msg)
-            sendQueueSnapshot(
+            completeQueueCommand(
                 pending,
-                org.json.JSONObject().apply {
+                ok = true,
+                error = null,
+                playbackId = null,
+                queueRevision = 0,
+                playlistStatusJson = org.json.JSONObject().apply {
                     put("type", "playlist_status")
                     put("items", org.json.JSONArray())
                     put("currentIndex", 0)
@@ -476,7 +480,6 @@ class ServerService : Service() {
                     put("queueRevision", 0)
                 }.toString(),
             )
-            completeQueueCommand(pending, true, null, null, 0)
             return
         }
         if (isQueueV1 && activeContext != "player") {
@@ -1457,8 +1460,17 @@ class ServerService : Service() {
             error: String?,
             playbackId: String?,
             queueRevision: Long,
+            playlistStatusJson: String? = null,
         ) {
-            val requestId = command.requestId ?: return
+            val requestId = command.requestId
+            if (requestId == null) {
+                playlistStatusJson?.let { status ->
+                    _staticInstance?.let { service ->
+                        service.scope.launch { service.webSocketServer?.broadcastStatus(status) }
+                    }
+                }
+                return
+            }
             val result = org.json.JSONObject().apply {
                 put("type", "command_result")
                 put("requestId", requestId)
@@ -1474,14 +1486,7 @@ class ServerService : Service() {
                 }
                 service.scope.launch {
                     service.webSocketServer?.sendTo(command.connectionId, result)
-                }
-            }
-        }
-
-        fun sendQueueSnapshot(command: PendingQueueCommand, statusJson: String) {
-            _staticInstance?.let { service ->
-                service.scope.launch {
-                    service.webSocketServer?.sendTo(command.connectionId, statusJson)
+                    playlistStatusJson?.let { service.webSocketServer?.broadcastStatus(it) }
                 }
             }
         }
